@@ -9,16 +9,11 @@ containers:
     env:
       # Upstream headless Docker deployments have an open Bonjour/mDNS issue.
       - OPENCLAW_DISABLE_BONJOUR: "1"
-    secrets:
-      - OPENCLAW_GATEWAY_TOKEN
-      - OPENCLAW_CONTROL_UI_ORIGIN
     command:
       - >-
         set -eu;
-        [ -n "${OPENCLAW_GATEWAY_TOKEN:-}" ] || { echo >&2 "OPENCLAW_GATEWAY_TOKEN is required"; exit 1; };
-        [ -n "${OPENCLAW_CONTROL_UI_ORIGIN:-}" ] || { echo >&2 "OPENCLAW_CONTROL_UI_ORIGIN is required"; exit 1; };
         mkdir -p /home/node/.openclaw &&
-        node -e 'const fs = require("node:fs"); const rawOrigin = (process.env.OPENCLAW_CONTROL_UI_ORIGIN || "").trim(); let normalizedOrigin; try { const parsed = new URL(rawOrigin); if (parsed.protocol !== "https:") { throw new Error("OPENCLAW_CONTROL_UI_ORIGIN must use https"); } normalizedOrigin = parsed.origin; } catch (error) { console.error(String(error)); process.exit(1); } const config = { gateway: { mode: "local", bind: "lan", controlUi: { basePath: "/openclaw", embedSandbox: "strict", allowedOrigins: [normalizedOrigin], dangerouslyDisableDeviceAuth: true }, auth: { mode: "token" } } }; fs.writeFileSync("/home/node/.openclaw/openclaw.json", JSON.stringify(config));' &&
+        node -e 'const crypto = require("node:crypto"); const fs = require("node:fs"); const token = crypto.randomBytes(32).toString("hex"); const config = { gateway: { mode: "local", bind: "lan", controlUi: { basePath: "/openclaw", embedSandbox: "strict", dangerouslyAllowHostHeaderOriginFallback: true, dangerouslyDisableDeviceAuth: true }, auth: { mode: "token", token } } }; fs.writeFileSync("/home/node/.openclaw/openclaw.json", JSON.stringify(config)); console.log("[openclaw-tinfoil] bootstrap_token=" + token); console.log("[openclaw-tinfoil] open the public deployment URL at /openclaw/#token=<bootstrap_token>");' &&
         exec docker-entrypoint.sh node openclaw.mjs gateway --allow-unconfigured
 
 shim:
@@ -30,23 +25,3 @@ shim:
     - /openclaw/favicon.svg
     - /openclaw/favicon-32.png
     - /openclaw/apple-touch-icon.png
-    - /openclaw/chat
-    - /openclaw/overview
-    - /openclaw/channels
-    - /openclaw/instances
-    - /openclaw/sessions
-    - /openclaw/usage
-    - /openclaw/cron
-    - /openclaw/agents
-    - /openclaw/skills
-    - /openclaw/nodes
-    - /openclaw/config
-    - /openclaw/communications
-    - /openclaw/appearance
-    - /openclaw/automation
-    - /openclaw/infrastructure
-    - /openclaw/ai-agents
-    - /openclaw/debug
-    - /openclaw/logs
-    - /openclaw/dreaming
-    - /openclaw/dreams
