@@ -13,7 +13,7 @@ This repo is now a thin Tinfoil deployment wrapper around the official OpenClaw 
   - a fixed public token: `1c8a9a2c3982cf74ea81d129ab6fa735e23833f5a5bd46eb90dead02272b1396`
   - `gateway.controlUi.basePath=/openclaw`
   - `gateway.controlUi.embedSandbox=strict`
-  - `gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback=true`
+  - `gateway.controlUi.allowedOrigins=["*"]`
   - `gateway.controlUi.dangerouslyDisableDeviceAuth=true`
 - startup prints the same public token to container logs as `public_token=...`
 - `.github/workflows/tinfoil-build.yml` measures the image and publishes a GitHub release when you push a `v*` tag
@@ -41,5 +41,5 @@ This repo is now a thin Tinfoil deployment wrapper around the official OpenClaw 
 - Tinfoil now exposes only the dashboard shell, its static assets, and the `/openclaw` WebSocket mount. OpenClaw helper routes such as bootstrap JSON, avatar, assistant media, canvas, health probes, and other gateway endpoints are not reachable from the public Tinfoil URL.
 - The static Control UI shell still loads publicly at `/openclaw/`, because the browser must load the app before it can present or use the token. The admin session still depends on the fixed public token over WebSocket.
 - The token is intentionally public in this repo so the first deployment is trivial. This is functionally close to no-auth for anyone who can read the repo or deployment URL, and it must be replaced later if you want a real security boundary.
-- This smoke-test config intentionally uses both `gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback=true` and `gateway.controlUi.dangerouslyDisableDeviceAuth=true`. They are break-glass shortcuts for first deploy, not a hardened long-term setup.
+- This smoke-test config intentionally uses `gateway.controlUi.allowedOrigins=["*"]` and `gateway.controlUi.dangerouslyDisableDeviceAuth=true`. That should get the dashboard through the WebSocket handshake from your Tinfoil URL, but it is not a hardened long-term setup.
 - Bonjour is disabled because there is an open upstream headless-Docker issue around mDNS advertisement loops. That should be fine for Tinfoil because mDNS discovery is not useful there.
