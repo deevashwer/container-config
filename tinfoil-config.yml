@@ -13,7 +13,7 @@ containers:
       - >-
         set -eu;
         mkdir -p /home/node/.openclaw &&
-        node -e 'const crypto = require("node:crypto"); const fs = require("node:fs"); const token = crypto.randomBytes(32).toString("hex"); const config = { gateway: { mode: "local", bind: "lan", controlUi: { basePath: "/openclaw", embedSandbox: "strict", dangerouslyAllowHostHeaderOriginFallback: true, dangerouslyDisableDeviceAuth: true }, auth: { mode: "token", token } } }; fs.writeFileSync("/home/node/.openclaw/openclaw.json", JSON.stringify(config)); console.log("[openclaw-tinfoil] bootstrap_token=" + token); console.log("[openclaw-tinfoil] open the public deployment URL at /openclaw/#token=<bootstrap_token>");' &&
+        node -e 'const fs = require("node:fs"); const token = "1c8a9a2c3982cf74ea81d129ab6fa735e23833f5a5bd46eb90dead02272b1396"; const config = { gateway: { mode: "local", bind: "lan", controlUi: { basePath: "/openclaw", embedSandbox: "strict", dangerouslyAllowHostHeaderOriginFallback: true, dangerouslyDisableDeviceAuth: true }, auth: { mode: "token", token } } }; fs.writeFileSync("/home/node/.openclaw/openclaw.json", JSON.stringify(config)); console.log("[openclaw-tinfoil] public_token=" + token); console.log("[openclaw-tinfoil] open the public deployment URL at /openclaw/#token=" + token);' &&
         exec docker-entrypoint.sh node openclaw.mjs gateway --allow-unconfigured
 
 shim:
