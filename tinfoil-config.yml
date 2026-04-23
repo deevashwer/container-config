@@ -1,31 +1,23 @@
-# Tinfoil Container Configuration
-# This file will be auto-populated when you deploy via the Tinfoil dashboard.
-# You can also edit it manually - see docs at https://docs.tinfoil.sh/containers/config
-#
-# After creating this repo from the template:
-# 1. Go to https://dash.tinfoil.sh and create a new container
-# 2. Provide this repository URL and your container details
-# 3. This file will be automatically updated with your deployment settings
-#
-# For updates: edit this file, commit, and push a new tag (e.g., v2)
-
 cvm-version: 0.7.5
 cpus: 2
 memory: 8192
 
-# Container configuration
-# Note: image must include SHA256 hash (e.g., image:tag@sha256:abc123...)
 containers:
-  - name: "app"
-    image: "your-image:tag@sha256:..."
+  - name: "openclaw"
+    image: "ghcr.io/openclaw/openclaw:2026.4.15-slim@sha256:734b55459a9d2eddd58a493577e1ff867a2680f13758349529bec91a0d2c0ea3"
+    entrypoint: ["sh", "-lc"]
     env:
-      - LOG_LEVEL: "info"
+      # Upstream headless Docker deployments have an open Bonjour/mDNS issue.
+      - OPENCLAW_DISABLE_BONJOUR: "1"
     secrets:
-      - API_KEY
-    command: ["--port", "8000"]
+      - OPENCLAW_GATEWAY_TOKEN
+    command:
+      - >-
+        mkdir -p /home/node/.openclaw &&
+        printf '%s\n' '{"gateway":{"mode":"local","bind":"lan","controlUi":{"dangerouslyAllowHostHeaderOriginFallback":true},"auth":{"mode":"token"}}}' > /home/node/.openclaw/openclaw.json &&
+        exec docker-entrypoint.sh node openclaw.mjs gateway --allow-unconfigured
 
-# Shim configuration (adjust upstream-port and paths to match your container)
 shim:
-  upstream-port: 8000
+  upstream-port: 18789
   paths:
-    - /health
+    - /*
