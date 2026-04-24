@@ -160,6 +160,7 @@ class FakeGatewaySession:
         return RemoteGatewayStatus(
             transport="verified transport",
             workspace_path=self.workspace_path,
+            remote_base_url=self.remote_base_url,
             public_config=self.public_config,
             verification_document=self.verification_document,
         )
@@ -202,6 +203,7 @@ def test_remote_session_bootstrap_logs_in_and_exposes_status() -> None:
     assert owner_client.ensure_calls == 1
     assert owner_client.login_calls == 1
     assert status_payload.workspace_path == "/openclaw/"
+    assert status_payload.remote_base_url == "https://remote.example"
     assert status_payload.transport == "verified transport"
     assert session.cookie_header() == "openclaw_owner_session=session-cookie"
 
@@ -229,14 +231,16 @@ def patch_websockets(monkeypatch) -> None:
     monkeypatch.setattr(gateway_module.websockets, "connect", DummyWebSocketsModule.connect)
 
 
-def test_browser_gateway_root_redirects_to_workspace() -> None:
+def test_browser_gateway_root_renders_verification_landing_page() -> None:
     app = create_browser_gateway_app(FakeGatewaySession())
 
     with TestClient(app) as client:
-        response = client.get("/", follow_redirects=False)
+        response = client.get("/")
 
-    assert response.status_code == 307
-    assert response.headers["location"] == "/openclaw/"
+    assert response.status_code == 200
+    assert "Attestation checked locally before the browser session begins." in response.text
+    assert 'href="/openclaw/"' in response.text
+    assert "https://remote.example" in response.text
 
 
 def test_browser_gateway_reports_local_status() -> None:
@@ -249,6 +253,7 @@ def test_browser_gateway_reports_local_status() -> None:
     body = response.json()
     assert body["transport"] == "verified transport"
     assert body["workspace_path"] == "/openclaw/"
+    assert body["remote_base_url"] == "https://remote.example"
     assert body["verification_document"]["security_verified"] is True
 
 

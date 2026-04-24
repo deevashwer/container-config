@@ -1,75 +1,116 @@
 # OpenClaw Auth Proxy
 
-This repo is now the minimal two-container stack:
+Minimal setup:
 
-- `openclaw`: a custom runtime image built on top of the public OpenClaw image
-- `auth-proxy`: the only public ingress, responsible for owner challenge-response and forwarding the browser into the real OpenClaw UI at `/openclaw/`
+- `openclaw`: custom runtime image with a loopback bootstrap server
+- `auth-proxy`: only public ingress
+- `python_client`: local owner-auth, verification, and browser-gateway tooling
 
-Anything outside that shape has been removed on purpose. The current task list lives in [`TODO.md`](TODO.md).
+Architecture and trust-path diagrams live in [`docs/stateful-openclaw-design.md`](docs/stateful-openclaw-design.md).
 
-## Layout
+## Files
 
-- [`docker-compose.yml`](docker-compose.yml): local bring-up from the checked-in `auth-proxy/` source
-- [`openclaw-runtime/`](openclaw-runtime): custom OpenClaw wrapper image with a localhost bootstrap server
-- [`tinfoil-config.yml`](tinfoil-config.yml): Tinfoil deployment shape
-- [`auth-proxy/`](auth-proxy): FastAPI proxy, browser unlock page, and tests
-- [`python_client/`](python_client): owner-auth client for `bootstrap`, `verify`, `request`, `chat`, and `serve`
+- [`docker-compose.yml`](docker-compose.yml): local two-container stack
+- [`tinfoil-config.yml`](tinfoil-config.yml): Tinfoil deployment config
+- [`openclaw-runtime/`](openclaw-runtime): custom OpenClaw wrapper image
+- [`auth-proxy/`](auth-proxy): FastAPI proxy and browser unlock page
+- [`python_client/`](python_client): local client for `bootstrap`, `verify`, `request`, `chat`, and `serve`
 
-## Local Bring-Up
+## Local Stack
 
-1. Generate an owner keypair and browser-importable state file. If `ANTHROPIC_API_KEY` is present in your shell, `bootstrap` stores it under `bootstrap_env` in the state JSON:
+Create owner state:
 
-   ```bash
-   ANTHROPIC_API_KEY=your-key-here \
-   python3 python_client/owner_auth_chat.py bootstrap \
-     --state-file /tmp/openclaw-owner-state.json \
-     --force
-   ```
+```bash
+ANTHROPIC_API_KEY=your-key-here \
+python3 python_client/owner_auth_chat.py bootstrap \
+  --state-file /tmp/openclaw-owner-state.json \
+  --force
+```
 
-2. Copy the printed `OWNER_PUBLIC_KEY_JWK=...` value into `.env`.
-3. Start the local stack:
+Copy the printed `OWNER_PUBLIC_KEY_JWK=...` into `.env`, then start:
 
-   ```bash
-   docker compose up --build
-   ```
+```bash
+docker compose up --build
+```
 
-4. Open `http://127.0.0.1:8080/`, load `/tmp/openclaw-owner-state.json`, and the page will send the state’s `bootstrap_env` to `auth-proxy` during signed session init. `auth-proxy` forwards that env to the loopback-only OpenClaw bootstrap server, which then launches OpenClaw and redirects you to `/openclaw/`.
+Use:
 
-5. Verify or hit endpoints directly from Python when needed:
+- browser unlock flow: `http://127.0.0.1:8080/`
+- direct verify:
 
-   ```bash
-   python3 python_client/owner_auth_chat.py verify \
-     --mode local \
-     --state-file /tmp/openclaw-owner-state.json \
-     --base-url http://127.0.0.1:8080
-   ```
+```bash
+python3 python_client/owner_auth_chat.py verify \
+  --mode local \
+  --state-file /tmp/openclaw-owner-state.json \
+  --base-url http://127.0.0.1:8080
+```
 
-   ```bash
-   python3 python_client/owner_auth_chat.py request \
-     --mode local \
-     --state-file /tmp/openclaw-owner-state.json \
-     --base-url http://127.0.0.1:8080 \
-     GET /openclaw/__openclaw/control-ui-config.json
-   ```
+- direct signed request:
 
-## Runtime Shape
+```bash
+python3 python_client/owner_auth_chat.py request \
+  --mode local \
+  --state-file /tmp/openclaw-owner-state.json \
+  --base-url http://127.0.0.1:8080 \
+  GET /openclaw/__openclaw/control-ui-config.json
+```
 
-- The custom `openclaw` runtime container starts a loopback-only bootstrap server first.
-- `auth-proxy` receives `bootstrap_env` from the signed owner-init request and forwards it to that bootstrap server before it issues the browser session.
-- The bootstrap server then launches OpenClaw with `gateway.bind="loopback"` and `gateway.auth.mode="none"`.
-- During bootstrap it also writes Anthropic-first agent defaults, so the initial session uses `anthropic/claude-sonnet-4-6` with an Anthropic-only fallback instead of stale Bedrock/OpenAI overrides.
-- Cold starts can take a while on this image, so the proxy/bootstrap handshake now allows up to 90 seconds for OpenClaw to become healthy.
-- The OpenClaw Control UI stays under `/openclaw`.
-- A demo HTTP service running inside the enclave on `127.0.0.1:3000` can be reached through the proxy at `/aux-application/*`.
-- Origin checks are relaxed inside OpenClaw because it only listens on loopback behind the proxy.
-- The auth proxy exposes only:
-  - `/`
-  - `/assets/*`
-  - `/favicon.svg`
-  - `/healthz`
-  - `/api/public/*`
-  - authenticated forwarding for everything else, including WebSockets
+## Verified Local Browser Gateway
 
-## Tinfoil Note
+Use this when you want local Python to:
 
-`docker-compose.yml` now builds both `auth-proxy` and the custom `openclaw-runtime` image from local source. `tinfoil-config.yml` still expects published image tags, so a remote rollout now needs a published `auth-proxy` image and a published custom OpenClaw runtime image with the same bootstrap behavior.
+- verify Tinfoil attestation
+- pin the upstream TLS key
+- hold the owner state locally
+- keep the remote session cookie out of the browser
+- serve a local landing page before opening OpenClaw
+
+Example against the deployed smoke test:
+
+```bash
+python3 python_client/owner_auth_chat.py serve \
+  --mode tinfoil \
+  --state-file /tmp/openclaw-owner-state.json \
+  --enclave openclaw-smoke-test.devesh-org.containers.tinfoil.dev \
+  --repo deevashwer/container-config \
+  --release-tag v0.0.8 \
+  --host 127.0.0.1 \
+  --port 8090 \
+  --open-browser
+```
+
+What happens:
+
+1. Python verifies the remote enclave and release measurement.
+2. Python signs the owner-auth login with the local state.
+3. Python keeps the upstream session cookie locally.
+4. Browser opens `http://127.0.0.1:8090/`.
+5. Browser traffic continues through the local gateway to the verified remote enclave.
+
+Important:
+
+- keep using the `localhost` URL for the verified demo
+- do not switch the browser over to the remote Tinfoil URL after verification
+
+Useful local endpoints while `serve` is running:
+
+- landing page: `http://127.0.0.1:8090/`
+- raw local status: `http://127.0.0.1:8090/api/local/status`
+- proxied OpenClaw UI: `http://127.0.0.1:8090/openclaw/`
+
+## Aux Application Demo
+
+An auxiliary HTTP app listening inside the enclave on `127.0.0.1:3000` is exposed through:
+
+```text
+/aux-application/*
+```
+
+That path is forwarded by `auth-proxy`; no second public shim port is required.
+
+## Releases
+
+Current published release used by `tinfoil-config.yml`:
+
+- `ghcr.io/deevashwer/openclaw-auth-proxy:v0.0.8@sha256:c0910cc904d38f1c74ef12caa37ce0a6bfc8435dacd589b3fda40ee1dc0aba98`
+- `ghcr.io/deevashwer/openclaw-runtime:v0.0.8@sha256:737356a7410c69e68c932d413b78ed282d18025ab3777a0f79492b633c15fb9d`

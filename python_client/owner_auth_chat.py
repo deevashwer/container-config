@@ -848,6 +848,10 @@ def cmd_serve(args: argparse.Namespace) -> int:
         local_url = f"http://{args.host}:{args.port}"
         print(f"local_browser_gateway={local_url}")
         print(f"workspace_url={local_url}{status_payload.workspace_path}")
+        if args.open_browser:
+            import webbrowser
+
+            webbrowser.open(local_url)
         app = create_browser_gateway_app(remote_session)
         uvicorn.run(app, host=args.host, port=args.port, reload=False, log_level=args.log_level)
         return 0
@@ -899,6 +903,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8090)
     serve.add_argument("--log-level", default="info")
+    serve.add_argument("--open-browser", action="store_true")
     serve.set_defaults(func=cmd_serve)
 
     return parser
