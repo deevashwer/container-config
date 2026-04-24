@@ -158,8 +158,8 @@ Browser automation coverage for the passkey approval flow is still pending.
 
 Current published release used by `tinfoil-config.yml`:
 
-- `ghcr.io/deevashwer/container-config-auth-proxy:v0.0.14@sha256:8d08f4077319da2b7473ad9eb92dae85c51bf0e97d6e630680459840a613ea86`
-- `ghcr.io/deevashwer/container-config-openclaw-runtime:v0.0.14@sha256:98a2e4a2b9a1968d6bde54f7f2e895d0070db0688942236f56600fc4578a79f3`
+- `ghcr.io/deevashwer/container-config-auth-proxy:v0.0.15@sha256:f40b00833915216cb7a48377e6da63cd28b81fd9901ffa5d1a4a636e631bf447`
+- `ghcr.io/deevashwer/container-config-openclaw-runtime:v0.0.15@sha256:7dc76e17d6c47047c3513bba609f9e3b39dc36cf24e4e3dfd37e982155e2da4c`
 
 Tag push automation:
 
