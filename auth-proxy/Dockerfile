@@ -11,7 +11,6 @@ RUN pip install --no-cache-dir --upgrade pip \
 
 COPY app /app/app
 COPY tests /app/tests
-COPY scripts /app/scripts
 
 RUN python -m pytest -q tests
 
