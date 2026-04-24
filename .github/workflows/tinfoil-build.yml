@@ -7,8 +7,8 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  AUTH_PROXY_IMAGE: ghcr.io/deevashwer/openclaw-auth-proxy
-  OPENCLAW_RUNTIME_IMAGE: ghcr.io/deevashwer/openclaw-runtime
+  AUTH_PROXY_IMAGE: ghcr.io/deevashwer/container-config-auth-proxy
+  OPENCLAW_RUNTIME_IMAGE: ghcr.io/deevashwer/container-config-openclaw-runtime
 
 jobs:
   publish-images:
@@ -43,6 +43,10 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: ${{ env.AUTH_PROXY_IMAGE }}:${{ github.ref_name }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ github.ref_name }}
           cache-from: type=gha,scope=auth-proxy
           cache-to: type=gha,mode=max,scope=auth-proxy
 
@@ -55,6 +59,10 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: ${{ env.OPENCLAW_RUNTIME_IMAGE }}:${{ github.ref_name }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ github.ref_name }}
           cache-from: type=gha,scope=openclaw-runtime
           cache-to: type=gha,mode=max,scope=openclaw-runtime
 

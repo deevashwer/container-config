@@ -10,8 +10,8 @@ SCRIPTS_DIR = REPO_ROOT / ".github" / "scripts"
 RENDER_SCRIPT = SCRIPTS_DIR / "render_release_config.py"
 SYNC_SCRIPT = SCRIPTS_DIR / "sync_release_refs.py"
 
-RUNTIME_IMAGE = "ghcr.io/deevashwer/openclaw-runtime"
-AUTH_PROXY_IMAGE = "ghcr.io/deevashwer/openclaw-auth-proxy"
+RUNTIME_IMAGE = "ghcr.io/deevashwer/container-config-openclaw-runtime"
+AUTH_PROXY_IMAGE = "ghcr.io/deevashwer/container-config-auth-proxy"
 TAG = "v9.9.9"
 RUNTIME_DIGEST = "sha256:" + "1" * 64
 AUTH_PROXY_DIGEST = "sha256:" + "2" * 64

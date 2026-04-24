@@ -5,15 +5,22 @@ import re
 from pathlib import Path
 
 
-DEFAULT_RUNTIME_IMAGE = "ghcr.io/deevashwer/openclaw-runtime"
-DEFAULT_AUTH_PROXY_IMAGE = "ghcr.io/deevashwer/openclaw-auth-proxy"
+DEFAULT_RUNTIME_IMAGE = "ghcr.io/deevashwer/container-config-openclaw-runtime"
+DEFAULT_AUTH_PROXY_IMAGE = "ghcr.io/deevashwer/container-config-auth-proxy"
+LEGACY_RUNTIME_IMAGE = "ghcr.io/deevashwer/openclaw-runtime"
+LEGACY_AUTH_PROXY_IMAGE = "ghcr.io/deevashwer/openclaw-auth-proxy"
 
 
-def replace_image_ref(content: str, repo: str, replacement: str) -> str:
-    pattern = re.compile(rf"{re.escape(repo)}:[^\"@\s]+(?:@sha256:[0-9a-f]+)?")
-    updated, count = pattern.subn(replacement, content, count=1)
-    if count != 1:
-        raise ValueError(f"expected exactly one image reference for {repo}, found {count}")
+def replace_any_image_ref(content: str, repos: tuple[str, ...], replacement: str) -> str:
+    total_count = 0
+    updated = content
+    for repo in repos:
+        pattern = re.compile(rf"{re.escape(repo)}:[^\"@\s]+(?:@sha256:[0-9a-f]+)?")
+        updated, count = pattern.subn(replacement, updated, count=1)
+        total_count += count
+    if total_count != 1:
+        repo_list = ", ".join(repos)
+        raise ValueError(f"expected exactly one image reference for one of [{repo_list}], found {total_count}")
     return updated
 
 
@@ -37,13 +44,16 @@ def main() -> int:
     output_path = Path(args.output_path)
 
     content = input_path.read_text()
-    replacements = {
-        args.runtime_image: f"{args.runtime_image}:{args.tag}@{args.runtime_digest}",
-        args.auth_proxy_image: f"{args.auth_proxy_image}:{args.tag}@{args.auth_proxy_digest}",
-    }
-
-    for repo, replacement in replacements.items():
-        content = replace_image_ref(content, repo, replacement)
+    content = replace_any_image_ref(
+        content,
+        (args.runtime_image, LEGACY_RUNTIME_IMAGE),
+        f"{args.runtime_image}:{args.tag}@{args.runtime_digest}",
+    )
+    content = replace_any_image_ref(
+        content,
+        (args.auth_proxy_image, LEGACY_AUTH_PROXY_IMAGE),
+        f"{args.auth_proxy_image}:{args.tag}@{args.auth_proxy_digest}",
+    )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(content)
