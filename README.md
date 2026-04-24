@@ -61,13 +61,72 @@ Specifically:
 
 `python_client/owner_auth_chat.py` no longer performs direct authenticated requests. That old model depended on a local owner private key, which no longer exists.
 
-Current commands:
+What replaced it:
 
 - `verify`: fetch `/api/public/config` and print attestation details when available
 - `serve`: run a localhost verification center that links into the real remote unlock page
 - `bootstrap`: print where secret state lives now and optionally purge the old `~/.config/openclaw-owner-chat/state.json`
 
 The browser remains the owner of `ANTHROPIC_API_KEY` in this model. `python_client` does not persist that secret anymore.
+
+Install the client dependencies first:
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -r python_client/requirements.txt
+```
+
+Local verification flow:
+
+```bash
+python3 python_client/owner_auth_chat.py verify \
+  --mode local \
+  --base-url http://127.0.0.1:8080
+```
+
+Local verified browser launch:
+
+```bash
+python3 python_client/owner_auth_chat.py serve \
+  --mode local \
+  --base-url http://127.0.0.1:8080 \
+  --host 127.0.0.1 \
+  --port 8090 \
+  --open-browser
+```
+
+Remote Tinfoil verification against a release:
+
+```bash
+python3 python_client/owner_auth_chat.py verify \
+  --mode tinfoil \
+  --enclave YOUR-ENCLAVE-HOST.containers.tinfoil.dev \
+  --repo deevashwer/container-config \
+  --release-tag YOUR-RELEASE-TAG
+```
+
+Remote verified browser launch:
+
+```bash
+python3 python_client/owner_auth_chat.py serve \
+  --mode tinfoil \
+  --enclave YOUR-ENCLAVE-HOST.containers.tinfoil.dev \
+  --repo deevashwer/container-config \
+  --release-tag YOUR-RELEASE-TAG \
+  --host 127.0.0.1 \
+  --port 8090 \
+  --open-browser
+```
+
+In `serve` mode:
+
+- Python verifies the remote target first
+- the local page shows the verification document and the current claim state
+- `http://127.0.0.1:8090/launch` redirects the browser to the real remote unlock page
+- passkey approval and browser-local secret storage still happen on the real enclave origin
+
+If you want to pin a measurement directly instead of a release tag, use `--measurement-file` in `tinfoil` mode.
 
 Current gap:
 
