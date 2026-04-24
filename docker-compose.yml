@@ -1,0 +1,29 @@
+services:
+  auth-proxy:
+    build:
+      context: .
+      dockerfile: auth-proxy/Dockerfile
+    network_mode: "service:openclaw"
+    environment:
+      PORT: "8080"
+      CHALLENGE_TTL_SECONDS: "60"
+      OWNER_PUBLIC_KEY_JWK: ${OWNER_PUBLIC_KEY_JWK}
+      UPSTREAM_BASE_URL: http://127.0.0.1:18789
+    depends_on:
+      - openclaw
+
+  openclaw:
+    image: ghcr.io/openclaw/openclaw:2026.4.15-slim@sha256:734b55459a9d2eddd58a493577e1ff867a2680f13758349529bec91a0d2c0ea3
+    ports:
+      - "8080:8080"
+    entrypoint:
+      - sh
+      - -lc
+    environment:
+      OPENCLAW_DISABLE_BONJOUR: "1"
+    command:
+      - >-
+        set -eu;
+        mkdir -p /home/node/.openclaw &&
+        node -e 'const fs = require("node:fs"); const config = { gateway: { mode: "local", bind: "loopback", controlUi: { basePath: "/openclaw", embedSandbox: "strict", allowedOrigins: ["*"], dangerouslyDisableDeviceAuth: true }, auth: { mode: "none" } } }; fs.writeFileSync("/home/node/.openclaw/openclaw.json", JSON.stringify(config)); console.log("[openclaw-local] bind=loopback auth_mode=none");' &&
+        exec docker-entrypoint.sh node openclaw.mjs gateway --allow-unconfigured
