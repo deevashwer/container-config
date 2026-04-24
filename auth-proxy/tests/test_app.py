@@ -369,6 +369,7 @@ def test_public_config_is_accessible_without_auth() -> None:
 
     assert response.status_code == 200
     assert response.json()["session_cookie_name"] == "proxy-session"
+    assert response.json()["authenticated"] is False
     assert response.json()["ownership_claimed"] is False
     assert response.json()["initialization_available"] is True
 
@@ -480,6 +481,19 @@ def test_session_status_and_logout_use_cookie_auth() -> None:
     assert locked.json()["detail"] == "missing session cookie"
 
 
+def test_public_config_reports_authenticated_session_state() -> None:
+    client = make_client()
+    passkey = VirtualPasskey()
+    initialize_enclave(client, passkey)
+
+    response = client.get("/api/public/config")
+
+    assert response.status_code == 200
+    assert response.json()["authenticated"] is True
+    assert response.json()["ownership_claimed"] is True
+    assert response.json()["initialization_available"] is False
+
+
 def test_public_routes_bypass_auth() -> None:
     client = make_client(
         public_patterns=("/", "/assets/*", "/favicon.svg", "/healthz", "/api/public/*", "/webhooks/*")
@@ -578,6 +592,7 @@ def test_initialization_requires_bootstrap_env_and_does_not_partially_claim_encl
     assert first.status_code == 409
     assert first.json()["detail"] == "upstream bootstrap env is required before OpenClaw can start"
     assert config.status_code == 200
+    assert config.json()["authenticated"] is False
     assert config.json()["ownership_claimed"] is False
     assert config.json()["initialization_available"] is True
     assert login_options.status_code == 409

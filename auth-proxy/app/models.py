@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 class PublicConfigResponse(BaseModel):
     app_name: str
     challenge_ttl_seconds: int
+    authenticated: bool
     ownership_claimed: bool
     initialization_available: bool
     passkey_count: int

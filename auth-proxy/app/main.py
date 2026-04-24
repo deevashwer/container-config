@@ -563,13 +563,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/public/config", response_model=PublicConfigResponse)
     async def public_config(
+        request: Request,
         runtime: Settings = Depends(get_runtime_settings),
         passkey_store: FileBackedPasskeyStore = Depends(get_passkey_store),
     ) -> PublicConfigResponse:
         passkey_count = await passkey_store.count()
+        authenticated = await try_session_auth(request) is not None
         return PublicConfigResponse(
             app_name=runtime.app_name,
             challenge_ttl_seconds=runtime.challenge_ttl_seconds,
+            authenticated=authenticated,
             ownership_claimed=passkey_count > 0,
             initialization_available=passkey_count == 0,
             passkey_count=passkey_count,

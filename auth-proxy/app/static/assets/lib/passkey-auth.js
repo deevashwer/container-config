@@ -277,17 +277,6 @@ export class PasskeyAuthBrowserClient {
     return this.publicConfig;
   }
 
-  async getSession() {
-    const response = await fetch(`${this.baseUrl}/api/private/session`, {
-      method: "GET",
-      credentials: "same-origin",
-    });
-    if (!response.ok) {
-      throw responseError(response.status, await response.text());
-    }
-    return response.json();
-  }
-
   async logout() {
     const response = await fetch(`${this.baseUrl}/api/private/session/logout`, {
       method: "POST",

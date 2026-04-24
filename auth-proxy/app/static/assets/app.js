@@ -247,7 +247,6 @@ async function completePasskeyFlow({ auto = false } = {}) {
     }
 
     await saveVaultIfNeeded(bootstrapEnv);
-    await refreshConfig();
     setTransportState("Session ready", "ready");
     setStatusNote("Proxy session created. Redirecting to OpenClaw.");
     window.location.assign(currentWorkspacePath());
@@ -306,14 +305,11 @@ async function init() {
     return;
   }
 
-  try {
-    await client.getSession();
+  if (state.config?.authenticated) {
     setTransportState("Session ready", "ready");
     setStatusNote("Existing browser session found. Redirecting to OpenClaw.");
     window.location.assign(currentWorkspacePath());
     return;
-  } catch {
-    // No active session; continue.
   }
 
   state.vaultMeta = await secretStore.metadata();
