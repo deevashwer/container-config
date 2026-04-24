@@ -12,6 +12,7 @@ from typing import Any
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 
 
 AUTH_VERSION = "openclaw-owner-auth-v1"
@@ -143,15 +144,32 @@ def verify_signature(
     signature_b64url: str,
     signing_payload: str,
 ) -> bool:
+    def verify_candidate(signature: bytes) -> bool:
+        try:
+            public_key.verify(
+                signature,
+                signing_payload.encode("utf-8"),
+                ec.ECDSA(hashes.SHA256()),
+            )
+            return True
+        except (InvalidSignature, ValueError):
+            return False
+
     try:
         signature = base64url_decode(signature_b64url)
-        public_key.verify(
-            signature,
-            signing_payload.encode("utf-8"),
-            ec.ECDSA(hashes.SHA256()),
-        )
-        return True
-    except (InvalidSignature, ValueError):
+        if verify_candidate(signature):
+            return True
+
+        # Browser Web Crypto commonly returns ECDSA signatures in raw P1363
+        # form (`r || s`) instead of DER. Accept that form too so the proxy
+        # can verify both the Python CLI and the browser shell.
+        if len(signature) == 64:
+            r = int.from_bytes(signature[:32], "big")
+            s = int.from_bytes(signature[32:], "big")
+            return verify_candidate(encode_dss_signature(r, s))
+
+        return False
+    except ValueError:
         return False
 
 

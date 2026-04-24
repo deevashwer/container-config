@@ -10,6 +10,9 @@ class PublicConfigResponse(BaseModel):
     challenge_ttl_seconds: int
     owner_key_id: str | None
     owner_key_configured: bool
+    public_path_patterns: list[str]
+    session_cookie_name: str
+    openclaw_workspace_path: str
 
 
 class ChallengeRequest(BaseModel):
@@ -25,3 +28,10 @@ class ChallengeResponse(BaseModel):
     key_id: str | None
     signing_payload: str
     version: str
+
+
+class SessionResponse(BaseModel):
+    authenticated: bool
+    key_id: str | None
+    auth_kind: str | None
+    expires_at: datetime | None = None

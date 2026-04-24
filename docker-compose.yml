@@ -1,12 +1,16 @@
 services:
   auth-proxy:
     build:
-      context: .
-      dockerfile: auth-proxy/Dockerfile
+      context: ./auth-proxy
+      dockerfile: Dockerfile
     network_mode: "service:openclaw"
     environment:
       PORT: "8080"
       CHALLENGE_TTL_SECONDS: "60"
+      SESSION_TTL_SECONDS: "43200"
+      SESSION_COOKIE_NAME: "openclaw_owner_session"
+      SESSION_COOKIE_SECURE: "false"
+      OPENCLAW_WORKSPACE_PATH: "/openclaw/"
       OWNER_PUBLIC_KEY_JWK: ${OWNER_PUBLIC_KEY_JWK}
       UPSTREAM_BASE_URL: http://127.0.0.1:18789
     depends_on:
@@ -25,5 +29,5 @@ services:
       - >-
         set -eu;
         mkdir -p /home/node/.openclaw &&
-        node -e 'const fs = require("node:fs"); const config = { gateway: { mode: "local", bind: "loopback", controlUi: { basePath: "/openclaw", embedSandbox: "strict", allowedOrigins: ["*"], dangerouslyDisableDeviceAuth: true }, auth: { mode: "none" } } }; fs.writeFileSync("/home/node/.openclaw/openclaw.json", JSON.stringify(config)); console.log("[openclaw-local] bind=loopback auth_mode=none");' &&
+        node -e 'const fs = require("node:fs"); const config = { gateway: { mode: "local", bind: "loopback", trustedProxies: ["127.0.0.1", "::1"], controlUi: { basePath: "/openclaw", embedSandbox: "strict", allowedOrigins: ["*"], dangerouslyDisableDeviceAuth: true }, auth: { mode: "none" } } }; fs.writeFileSync("/home/node/.openclaw/openclaw.json", JSON.stringify(config)); console.log("[openclaw-local] bind=loopback auth_mode=none origin_checks=disabled");' &&
         exec docker-entrypoint.sh node openclaw.mjs gateway --allow-unconfigured

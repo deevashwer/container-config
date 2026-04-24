@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OpenClaw Secure Console</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/assets/styles.css" />
+  </head>
+  <body>
+    <main class="unlock-shell">
+      <section class="unlock-card">
+        <p class="eyebrow">Owner-authenticated OpenClaw gateway</p>
+        <h1>OpenClaw Secure Console</h1>
+        <p class="lede">
+          Load the owner state JSON once. The page signs the proxy challenge,
+          creates the browser session, and then sends you directly to the real
+          OpenClaw chat.
+        </p>
+
+        <div class="status-row">
+          <span class="status-pill" id="transport-status">Checking proxy</span>
+          <span class="status-note" id="status-note">Waiting for proxy metadata.</span>
+        </div>
+
+        <div class="action-stack">
+          <label class="primary-button" for="owner-state-file">Choose owner state file</label>
+          <input id="owner-state-file" type="file" accept=".json,application/json" hidden />
+
+          <label class="remember-inline">
+            <input id="remember-state-toggle" type="checkbox" checked />
+            <span>Remember this key on this browser</span>
+          </label>
+
+          <details class="paste-panel">
+            <summary>Paste JSON instead</summary>
+            <label class="field">
+              <span>Owner state JSON or raw private JWK</span>
+              <textarea
+                id="owner-state-json"
+                rows="9"
+                placeholder='{"owner_private_jwk": {...}, "owner_key_id": "..."}'
+              ></textarea>
+            </label>
+            <button class="secondary-button" id="load-json-button" type="button">
+              Unlock from pasted JSON
+            </button>
+          </details>
+        </div>
+
+        <div class="owner-summary" id="owner-summary">
+          <p class="owner-summary-title">No owner key loaded</p>
+          <p class="owner-summary-copy">
+            Use the JSON created by <code>python_client/owner_auth_chat.py bootstrap --state-file ...</code>.
+          </p>
+        </div>
+
+        <details class="details-panel">
+          <summary>Show details</summary>
+          <dl class="kv-grid">
+            <div>
+              <dt>Proxy app</dt>
+              <dd id="config-app-name">Loading</dd>
+            </div>
+            <div>
+              <dt>Challenge TTL</dt>
+              <dd id="config-challenge-ttl">-</dd>
+            </div>
+            <div>
+              <dt>Server owner key</dt>
+              <dd class="mono" id="config-owner-key-id">-</dd>
+            </div>
+            <div>
+              <dt>Workspace path</dt>
+              <dd class="mono" id="config-workspace-path">-</dd>
+            </div>
+          </dl>
+          <div class="details-actions">
+            <button class="ghost-button" id="clear-owner-state" type="button">Clear saved key</button>
+            <button class="ghost-button" id="logout-session-button" type="button">Clear session</button>
+          </div>
+        </details>
+      </section>
+    </main>
+    <script type="module" src="/assets/app.js"></script>
+  </body>
+</html>

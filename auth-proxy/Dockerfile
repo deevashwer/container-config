@@ -5,13 +5,13 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-COPY auth-proxy/requirements.txt /tmp/requirements.txt
+COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r /tmp/requirements.txt
 
-COPY auth-proxy/app /app/app
-COPY auth-proxy/tests /app/tests
-COPY auth-proxy/scripts /app/scripts
+COPY app /app/app
+COPY tests /app/tests
+COPY scripts /app/scripts
 
 RUN python -m pytest -q tests
 

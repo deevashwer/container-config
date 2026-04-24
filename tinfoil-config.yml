@@ -12,20 +12,28 @@ containers:
       - >-
         set -eu;
         mkdir -p /home/node/.openclaw &&
-        node -e 'const fs = require("node:fs"); const config = { gateway: { mode: "local", bind: "loopback", controlUi: { basePath: "/openclaw", embedSandbox: "strict", allowedOrigins: ["*"], dangerouslyDisableDeviceAuth: true }, auth: { mode: "none" } } }; fs.writeFileSync("/home/node/.openclaw/openclaw.json", JSON.stringify(config)); console.log("[openclaw-tinfoil] bind=loopback auth_mode=none");' &&
+        node -e 'const fs = require("node:fs"); const config = { gateway: { mode: "local", bind: "loopback", trustedProxies: ["127.0.0.1", "::1"], controlUi: { basePath: "/openclaw", embedSandbox: "strict", allowedOrigins: ["*"], dangerouslyDisableDeviceAuth: true }, auth: { mode: "none" } } }; fs.writeFileSync("/home/node/.openclaw/openclaw.json", JSON.stringify(config)); console.log("[openclaw-tinfoil] bind=loopback auth_mode=none origin_checks=disabled");' &&
         exec docker-entrypoint.sh node openclaw.mjs gateway --allow-unconfigured
   - name: "auth-proxy"
     image: "ghcr.io/deevashwer/openclaw-auth-proxy:v0.0.6@sha256:4ae69efecf653e9d09febe6ef087f7b9f16448fd782f670f52f833b562d527e6"
     env:
       - PORT: "8080"
       - CHALLENGE_TTL_SECONDS: "60"
+      - SESSION_TTL_SECONDS: "43200"
+      - SESSION_COOKIE_NAME: "openclaw_owner_session"
+      - SESSION_COOKIE_SECURE: "true"
+      - OPENCLAW_WORKSPACE_PATH: "/openclaw/"
       - OWNER_PUBLIC_KEY_JWK: '{"crv":"P-256","kty":"EC","x":"_MS9l7l6IuF-wXP8jFerP3D9H4LmQDRcecNgb7_n7AQ","y":"PXeYvImoCu-JdgHGXVG3l7itaC4hnSDuWvNAzc0lP_c"}'
       - UPSTREAM_BASE_URL: "http://127.0.0.1:18789"
 
 shim:
   upstream-port: 8080
   paths:
+    - /
+    - /assets/*
+    - /favicon.svg
     - /api/public/*
+    - /api/private/*
     - /healthz
     - /openclaw
     - /openclaw/*
