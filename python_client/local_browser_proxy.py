@@ -158,8 +158,7 @@ class AuthenticatedRemoteSession:
         )
 
     def login(self) -> None:
-        response = self.owner_client.authenticated_request("POST", "/api/private/session/login")
-        response.raise_for_status()
+        self.owner_client.login_session()
 
     def cookie_header(self) -> str:
         client = getattr(self.transport, "client", None)

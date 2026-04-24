@@ -30,8 +30,12 @@ class Settings:
     owner_key_id: str | None
     challenge_ttl_seconds: int
     upstream_base_url: str | None
+    aux_application_base_url: str | None
+    aux_application_path_prefix: str | None
+    openclaw_bootstrap_base_url: str | None
     upstream_origin: str | None
     upstream_timeout_seconds: float
+    bootstrap_timeout_seconds: float
     public_path_patterns: tuple[str, ...]
     session_ttl_seconds: int
     session_cookie_name: str
@@ -44,11 +48,15 @@ def build_settings(
     *,
     owner_public_key_jwk: dict[str, Any] | None,
     upstream_base_url: str | None,
+    aux_application_base_url: str | None = None,
+    aux_application_path_prefix: str | None = "/aux-application",
+    openclaw_bootstrap_base_url: str | None = None,
     upstream_origin: str | None = None,
     port: int = 8080,
     app_name: str = "OpenClaw Auth Proxy",
     challenge_ttl_seconds: int = 60,
     upstream_timeout_seconds: float = 20.0,
+    bootstrap_timeout_seconds: float = 90.0,
     public_path_patterns: tuple[str, ...] = DEFAULT_PUBLIC_PATH_PATTERNS,
     session_ttl_seconds: int = 60 * 60 * 12,
     session_cookie_name: str = "openclaw_owner_session",
@@ -76,8 +84,14 @@ def build_settings(
         owner_key_id=owner_key_id,
         challenge_ttl_seconds=challenge_ttl_seconds,
         upstream_base_url=upstream_base_url,
+        aux_application_base_url=aux_application_base_url,
+        aux_application_path_prefix=(aux_application_path_prefix.strip().rstrip("/") or "/aux-application")
+        if aux_application_path_prefix
+        else None,
+        openclaw_bootstrap_base_url=openclaw_bootstrap_base_url,
         upstream_origin=resolved_upstream_origin,
         upstream_timeout_seconds=upstream_timeout_seconds,
+        bootstrap_timeout_seconds=bootstrap_timeout_seconds,
         public_path_patterns=public_path_patterns,
         session_ttl_seconds=session_ttl_seconds,
         session_cookie_name=session_cookie_name,
@@ -121,9 +135,13 @@ def get_settings() -> Settings:
         port=int(os.getenv("PORT", "8080")),
         owner_public_key_jwk=_parse_optional_json(os.getenv("OWNER_PUBLIC_KEY_JWK")),
         upstream_base_url=upstream_base_url or None,
+        aux_application_base_url=os.getenv("AUX_APPLICATION_BASE_URL", "").strip() or None,
+        aux_application_path_prefix=os.getenv("AUX_APPLICATION_PATH_PREFIX", "/aux-application").strip() or "/aux-application",
+        openclaw_bootstrap_base_url=os.getenv("OPENCLAW_BOOTSTRAP_BASE_URL", "").strip() or None,
         upstream_origin=os.getenv("UPSTREAM_ORIGIN", "").strip() or None,
         challenge_ttl_seconds=int(os.getenv("CHALLENGE_TTL_SECONDS", "60")),
         upstream_timeout_seconds=float(os.getenv("UPSTREAM_TIMEOUT_SECONDS", "20")),
+        bootstrap_timeout_seconds=float(os.getenv("BOOTSTRAP_TIMEOUT_SECONDS", "90")),
         public_path_patterns=_parse_patterns(os.getenv("PUBLIC_PATH_PATTERNS")),
         session_ttl_seconds=int(os.getenv("SESSION_TTL_SECONDS", str(60 * 60 * 12))),
         session_cookie_name=os.getenv("SESSION_COOKIE_NAME", "openclaw_owner_session").strip(),

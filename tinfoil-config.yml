@@ -4,18 +4,12 @@ memory: 16384
 
 containers:
   - name: "openclaw"
-    image: "ghcr.io/openclaw/openclaw:2026.4.15-slim@sha256:734b55459a9d2eddd58a493577e1ff867a2680f13758349529bec91a0d2c0ea3"
-    entrypoint: ["sh", "-lc"]
+    image: "ghcr.io/deevashwer/openclaw-runtime:v0.0.8@sha256:737356a7410c69e68c932d413b78ed282d18025ab3777a0f79492b633c15fb9d"
     env:
       - OPENCLAW_DISABLE_BONJOUR: "1"
-    command:
-      - >-
-        set -eu;
-        mkdir -p /home/node/.openclaw &&
-        node -e 'const fs = require("node:fs"); const config = { gateway: { mode: "local", bind: "loopback", trustedProxies: ["127.0.0.1", "::1"], controlUi: { basePath: "/openclaw", embedSandbox: "strict", allowedOrigins: ["*"], dangerouslyDisableDeviceAuth: true }, auth: { mode: "none" } } }; fs.writeFileSync("/home/node/.openclaw/openclaw.json", JSON.stringify(config)); console.log("[openclaw-tinfoil] bind=loopback auth_mode=none origin_checks=disabled");' &&
-        exec docker-entrypoint.sh node openclaw.mjs gateway --allow-unconfigured
+      - OPENCLAW_BOOTSTRAP_WAIT_MS: "90000"
   - name: "auth-proxy"
-    image: "ghcr.io/deevashwer/openclaw-auth-proxy:v0.0.6@sha256:4ae69efecf653e9d09febe6ef087f7b9f16448fd782f670f52f833b562d527e6"
+    image: "ghcr.io/deevashwer/openclaw-auth-proxy:v0.0.8@sha256:c0910cc904d38f1c74ef12caa37ce0a6bfc8435dacd589b3fda40ee1dc0aba98"
     env:
       - PORT: "8080"
       - CHALLENGE_TTL_SECONDS: "60"
@@ -23,8 +17,12 @@ containers:
       - SESSION_COOKIE_NAME: "openclaw_owner_session"
       - SESSION_COOKIE_SECURE: "true"
       - OPENCLAW_WORKSPACE_PATH: "/openclaw/"
-      - OWNER_PUBLIC_KEY_JWK: '{"crv":"P-256","kty":"EC","x":"_MS9l7l6IuF-wXP8jFerP3D9H4LmQDRcecNgb7_n7AQ","y":"PXeYvImoCu-JdgHGXVG3l7itaC4hnSDuWvNAzc0lP_c"}'
+      - OWNER_PUBLIC_KEY_JWK: '{"crv":"P-256","kty":"EC","x":"WUvrTCSyyHsHKjAhmv5wHJV6JNvOtqSzUElseK3cSiE","y":"uJ7iTfQX-s8OOX7KXuQ5eBB5aDK5dWujLKrI_qe2Vr0"}'
+      - OPENCLAW_BOOTSTRAP_BASE_URL: "http://127.0.0.1:18788"
       - UPSTREAM_BASE_URL: "http://127.0.0.1:18789"
+      - AUX_APPLICATION_BASE_URL: "http://127.0.0.1:3000"
+      - AUX_APPLICATION_PATH_PREFIX: "/aux-application"
+      - BOOTSTRAP_TIMEOUT_SECONDS: "90"
 
 shim:
   upstream-port: 8080
@@ -37,3 +35,5 @@ shim:
     - /healthz
     - /openclaw
     - /openclaw/*
+    - /aux-application
+    - /aux-application/*

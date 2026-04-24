@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import json
 import logging
 import os
 from collections.abc import AsyncIterator
@@ -29,7 +30,14 @@ except ImportError:  # pragma: no cover - exercised only in minimal local test e
     class InvalidStatus(Exception):
         response = None
 
-from .models import ChallengeRequest, ChallengeResponse, PublicConfigResponse, SessionResponse
+from .models import (
+    ChallengeRequest,
+    ChallengeResponse,
+    PublicConfigResponse,
+    SessionLoginRequest,
+    SessionResponse,
+    UpstreamBootstrapRequest,
+)
 from .security import (
     AUTH_VERSION,
     ChallengeError,
@@ -199,6 +207,45 @@ def build_upstream_url(base_url: str, *, path: str, query: str = "", websocket: 
     return urlunsplit(upstream_parts)
 
 
+def resolve_upstream_target(
+    settings: Settings,
+    *,
+    path: str,
+    query: str = "",
+    websocket: bool = False,
+) -> tuple[str, str]:
+    aux_prefix = settings.aux_application_path_prefix
+    if aux_prefix and settings.aux_application_base_url:
+        if path == aux_prefix or path.startswith(f"{aux_prefix}/"):
+            stripped_path = path[len(aux_prefix) :] or "/"
+            if not stripped_path.startswith("/"):
+                stripped_path = f"/{stripped_path}"
+            return (
+                build_upstream_url(
+                    settings.aux_application_base_url,
+                    path=stripped_path,
+                    query=query,
+                    websocket=websocket,
+                ),
+                settings.aux_application_base_url,
+            )
+
+    if not settings.upstream_base_url:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="UPSTREAM_BASE_URL is not configured",
+        )
+    return (
+        build_upstream_url(
+            settings.upstream_base_url,
+            path=path,
+            query=query,
+            websocket=websocket,
+        ),
+        settings.upstream_base_url,
+    )
+
+
 def get_runtime_settings(request: Request) -> Settings:
     return request.app.state.settings
 
@@ -209,6 +256,69 @@ def get_challenge_store(request: Request) -> InMemoryChallengeStore:
 
 def get_session_store(request: Request) -> InMemorySessionStore:
     return request.app.state.session_store
+
+
+def sanitize_client_bootstrap_env(raw_env: dict[str, str] | None) -> dict[str, str]:
+    if not raw_env:
+        return {}
+    allowed_keys = {"ANTHROPIC_API_KEY"}
+    sanitized: dict[str, str] = {}
+    for key, value in raw_env.items():
+        if key not in allowed_keys:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"unsupported bootstrap env key: {key}",
+            )
+        normalized_value = str(value).strip()
+        if normalized_value:
+            sanitized[key] = normalized_value
+    return sanitized
+
+
+async def ensure_upstream_bootstrapped(app: FastAPI, bootstrap_env: dict[str, str] | None = None) -> None:
+    settings: Settings = app.state.settings
+    if not settings.openclaw_bootstrap_base_url:
+        return
+    if app.state.upstream_bootstrap_complete:
+        return
+    if not bootstrap_env:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="upstream bootstrap env is required before OpenClaw can start",
+        )
+
+    async with app.state.upstream_bootstrap_lock:
+        if app.state.upstream_bootstrap_complete:
+            return
+
+        bootstrap_url = f"{settings.openclaw_bootstrap_base_url.rstrip('/')}/api/bootstrap/config"
+        payload = UpstreamBootstrapRequest(env=bootstrap_env).model_dump(mode="json")
+        timeout = httpx.Timeout(settings.bootstrap_timeout_seconds)
+        try:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+                response = await client.request(
+                    method="POST",
+                    url=bootstrap_url,
+                    headers={"content-type": "application/json"},
+                    content=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+                )
+        except httpx.TimeoutException as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=(
+                    "timed out waiting for upstream bootstrap to finish "
+                    f"after {settings.bootstrap_timeout_seconds:.0f}s"
+                ),
+            ) from exc
+
+        if response.status_code >= 400:
+            detail = response.text or f"bootstrap request failed with status {response.status_code}"
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"failed to bootstrap upstream: {detail}",
+            )
+
+        app.state.upstream_bootstrap_complete = True
 
 
 def path_matches_pattern(path: str, pattern: str) -> bool:
@@ -371,6 +481,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = runtime_settings
     app.state.challenge_store = InMemoryChallengeStore(runtime_settings.challenge_ttl_seconds)
     app.state.session_store = InMemorySessionStore(runtime_settings.session_ttl_seconds)
+    app.state.upstream_bootstrap_lock = asyncio.Lock()
+    app.state.upstream_bootstrap_complete = False
     app.mount("/assets", StaticFiles(directory=STATIC_DIR / "assets"), name="assets")
 
     @app.get("/", include_in_schema=False)
@@ -419,20 +531,35 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/private/session/login", response_model=SessionResponse)
     async def login_session(
+        payload: SessionLoginRequest,
         verified: VerifiedRequest = Depends(require_owner_auth_headers),
         runtime: Settings = Depends(get_runtime_settings),
         session_store: InMemorySessionStore = Depends(get_session_store),
     ) -> Response:
+        await ensure_upstream_bootstrapped(app, sanitize_client_bootstrap_env(payload.bootstrap_env))
         session = await session_store.issue(key_id=verified.key_id)
-        payload = SessionResponse(
+        response_payload = SessionResponse(
             authenticated=True,
             key_id=session.key_id,
             auth_kind="session",
             expires_at=session.expires_at,
         )
-        response = JSONResponse(payload.model_dump(mode="json"))
+        response = JSONResponse(response_payload.model_dump(mode="json"))
         set_session_cookie(response, settings=runtime, session=session)
         return response
+
+    @app.post("/api/private/bootstrap")
+    async def bootstrap_upstream(
+        payload: UpstreamBootstrapRequest,
+        verified: VerifiedRequest = Depends(require_authenticated_request),
+    ) -> dict[str, object]:
+        del verified
+        sanitized_env = sanitize_client_bootstrap_env(payload.env)
+        await ensure_upstream_bootstrapped(app, sanitized_env)
+        return {
+            "bootstrapped": True,
+            "env_keys": sorted(sanitized_env.keys()),
+        }
 
     @app.get("/api/private/session", response_model=SessionResponse)
     async def session_status(request: Request) -> SessionResponse:
@@ -472,22 +599,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> Response:
         del path
 
-        if not runtime.upstream_base_url:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="UPSTREAM_BASE_URL is not configured",
-            )
-
         if not is_public_path(request.url.path, runtime):
             await require_authenticated_request(request)
+            if runtime.openclaw_bootstrap_base_url and not app.state.upstream_bootstrap_complete:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="upstream bootstrap has not completed; initialize the session first",
+                )
 
-        upstream_url = build_upstream_url(
-            runtime.upstream_base_url,
+        upstream_url, upstream_origin_base = resolve_upstream_target(
+            runtime,
             path=request.url.path or "/",
             query=request.url.query,
         )
         content = await request.body()
-        headers = filter_upstream_request_headers(request, upstream_origin=runtime.upstream_origin)
+        upstream_origin = runtime.upstream_origin
+        if runtime.aux_application_base_url and upstream_origin_base == runtime.aux_application_base_url:
+            upstream_origin = None
+        headers = filter_upstream_request_headers(request, upstream_origin=upstream_origin)
         timeout = httpx.Timeout(runtime.upstream_timeout_seconds)
 
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
@@ -515,9 +644,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         browser_origin = websocket.headers.get("origin")
         browser_host = websocket.headers.get("host")
         client_host = websocket.client.host if websocket.client else None
-        if not runtime.upstream_base_url:
-            await websocket.close(code=status.WS_1011_INTERNAL_ERROR, reason="UPSTREAM_BASE_URL is not configured")
-            return
         if websockets.connect is None:
             await websocket.close(code=status.WS_1011_INTERNAL_ERROR, reason="websockets dependency is not installed")
             return
@@ -525,6 +651,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not is_public_path(websocket.url.path, runtime):
             try:
                 await require_websocket_session(websocket)
+                if runtime.openclaw_bootstrap_base_url and not websocket.app.state.upstream_bootstrap_complete:
+                    await websocket.close(
+                        code=status.WS_1011_INTERNAL_ERROR,
+                        reason="upstream bootstrap has not completed",
+                    )
+                    return
             except RuntimeError as exc:
                 LOGGER.warning(
                     "rejecting websocket before upstream connect path=%s client=%s host=%s origin=%s reason=%s",
@@ -535,15 +667,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     str(exc),
                 )
                 return
-
-        upstream_url = build_upstream_url(
-            runtime.upstream_base_url,
-            path=websocket.url.path or "/",
-            query=websocket.url.query,
-            websocket=True,
-        )
+        try:
+            upstream_url, upstream_origin_base = resolve_upstream_target(
+                runtime,
+                path=websocket.url.path or "/",
+                query=websocket.url.query,
+                websocket=True,
+            )
+        except HTTPException as exc:
+            await websocket.close(code=status.WS_1011_INTERNAL_ERROR, reason=str(exc.detail))
+            return
         forwarded_headers = filter_upstream_websocket_headers(websocket)
         subprotocols = split_websocket_subprotocols(websocket)
+        upstream_origin = browser_origin or runtime.upstream_origin
+        if runtime.aux_application_base_url and upstream_origin_base == runtime.aux_application_base_url:
+            upstream_origin = browser_origin or None
 
         try:
             async with websockets.connect(
@@ -552,7 +690,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 subprotocols=subprotocols or None,
                 open_timeout=runtime.upstream_timeout_seconds,
                 max_size=None,
-                origin=browser_origin or runtime.upstream_origin,
+                origin=upstream_origin,
             ) as upstream:
                 await websocket.accept(subprotocol=upstream.subprotocol)
 

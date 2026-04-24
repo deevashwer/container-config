@@ -30,6 +30,7 @@ from app.settings import build_settings
 
 class DummyAsyncClient:
     last_request: dict[str, object] | None = None
+    requests: list[dict[str, object]] = []
 
     def __init__(self, *args, **kwargs) -> None:
         self.args = args
@@ -54,7 +55,15 @@ class DummyAsyncClient:
             "headers": headers or {},
             "content": content or b"",
         }
+        DummyAsyncClient.requests.append(DummyAsyncClient.last_request)
         request = httpx.Request(method, url)
+        if url == "http://bootstrap/api/bootstrap/config":
+            return httpx.Response(
+                200,
+                json={"status": "ready", "ready": True},
+                headers={"content-type": "application/json"},
+                request=request,
+            )
         return httpx.Response(
             200,
             json={"forwarded": True, "url": url},
@@ -130,12 +139,16 @@ class DummyWebSocketsModule:
 def make_client(
     *,
     public_patterns: tuple[str, ...] = ("/", "/assets/*", "/favicon.svg", "/healthz", "/api/public/*"),
+    aux_application_base_url: str | None = None,
+    aux_application_path_prefix: str = "/aux-application",
 ) -> tuple[TestClient, ec.EllipticCurvePrivateKey]:
     private_key = ec.generate_private_key(ec.SECP256R1())
     public_jwk = public_jwk_from_key(private_key.public_key())
     settings = build_settings(
         owner_public_key_jwk=public_jwk,
         upstream_base_url="http://example-upstream",
+        aux_application_base_url=aux_application_base_url,
+        aux_application_path_prefix=aux_application_path_prefix,
         challenge_ttl_seconds=60,
         session_ttl_seconds=300,
         session_cookie_name="proxy-session",
@@ -187,6 +200,7 @@ def auth_headers(
 @pytest.fixture(autouse=True)
 def patch_network_clients(monkeypatch) -> None:
     DummyAsyncClient.last_request = None
+    DummyAsyncClient.requests = []
     DummyWebSocketsModule.last_connection = None
     monkeypatch.setattr(main_module.httpx, "AsyncClient", DummyAsyncClient)
     monkeypatch.setattr(main_module.websockets, "connect", DummyWebSocketsModule.connect)
@@ -371,14 +385,20 @@ def test_proxy_rejects_invalid_signature() -> None:
 
 def test_session_login_creates_cookie_and_allows_followup_requests() -> None:
     client, private_key = make_client()
+    request_body = '{"bootstrap_env":{"ANTHROPIC_API_KEY":"x"}}'
     headers = auth_headers(
         client,
         private_key,
         method="POST",
         path="/api/private/session/login",
+        body=request_body,
     )
 
-    login = client.post("/api/private/session/login", headers=headers)
+    login = client.post(
+        "/api/private/session/login",
+        headers={**headers, "content-type": "application/json"},
+        content=request_body,
+    )
     follow_up = client.get("/openclaw")
 
     assert login.status_code == 200
@@ -405,8 +425,13 @@ def test_session_status_supports_header_and_cookie_auth() -> None:
         private_key,
         method="POST",
         path="/api/private/session/login",
+        body='{"bootstrap_env":{"ANTHROPIC_API_KEY":"x"}}',
     )
-    login = client.post("/api/private/session/login", headers=login_headers)
+    login = client.post(
+        "/api/private/session/login",
+        headers={**login_headers, "content-type": "application/json"},
+        content='{"bootstrap_env":{"ANTHROPIC_API_KEY":"x"}}',
+    )
     via_cookie = client.get("/api/private/session")
 
     assert direct.status_code == 200
@@ -419,13 +444,19 @@ def test_session_status_supports_header_and_cookie_auth() -> None:
 
 def test_session_logout_clears_cookie_and_relocks_private_routes() -> None:
     client, private_key = make_client()
+    request_body = '{"bootstrap_env":{"ANTHROPIC_API_KEY":"x"}}'
     headers = auth_headers(
         client,
         private_key,
         method="POST",
         path="/api/private/session/login",
+        body=request_body,
     )
-    client.post("/api/private/session/login", headers=headers)
+    client.post(
+        "/api/private/session/login",
+        headers={**headers, "content-type": "application/json"},
+        content=request_body,
+    )
 
     logout = client.post("/api/private/session/logout")
     locked = client.get("/openclaw")
@@ -451,6 +482,47 @@ def test_public_routes_bypass_auth() -> None:
     assert DummyAsyncClient.last_request["url"] == "http://example-upstream/webhooks/telegram"
 
 
+def test_aux_application_prefix_routes_to_alternate_upstream() -> None:
+    client, private_key = make_client(aux_application_base_url="http://127.0.0.1:3000")
+    headers = auth_headers(
+        client,
+        private_key,
+        method="GET",
+        path="/aux-application/index.html",
+    )
+
+    response = client.get("/aux-application/index.html", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json()["forwarded"] is True
+    assert DummyAsyncClient.last_request is not None
+    assert DummyAsyncClient.last_request["url"] == "http://127.0.0.1:3000/index.html"
+
+
+def test_aux_application_websocket_routes_to_alternate_upstream() -> None:
+    client, private_key = make_client(aux_application_base_url="http://127.0.0.1:3000")
+    request_body = '{"bootstrap_env":{"ANTHROPIC_API_KEY":"x"}}'
+    headers = auth_headers(
+        client,
+        private_key,
+        method="POST",
+        path="/api/private/session/login",
+        body=request_body,
+    )
+    client.post(
+        "/api/private/session/login",
+        headers={**headers, "content-type": "application/json"},
+        content=request_body,
+    )
+
+    with client.websocket_connect("/aux-application/ws") as websocket:
+        websocket.send_text("hello")
+        assert websocket.receive_text() == "echo:hello"
+
+    assert DummyWebSocketsModule.last_connection is not None
+    assert DummyWebSocketsModule.last_connection.url == "ws://127.0.0.1:3000/ws"
+
+
 def test_protected_websocket_rejects_missing_session() -> None:
     client, private_key = make_client()
     del private_key
@@ -464,13 +536,19 @@ def test_protected_websocket_rejects_missing_session() -> None:
 
 def test_protected_websocket_forwards_after_session_login() -> None:
     client, private_key = make_client()
+    request_body = '{"bootstrap_env":{"ANTHROPIC_API_KEY":"x"}}'
     headers = auth_headers(
         client,
         private_key,
         method="POST",
         path="/api/private/session/login",
+        body=request_body,
     )
-    client.post("/api/private/session/login", headers=headers)
+    client.post(
+        "/api/private/session/login",
+        headers={**headers, "content-type": "application/json"},
+        content=request_body,
+    )
 
     with client.websocket_connect(
         "/openclaw/ws",
@@ -489,6 +567,93 @@ def test_protected_websocket_forwards_after_session_login() -> None:
     assert DummyWebSocketsModule.last_connection.additional_headers is not None
     assert DummyWebSocketsModule.last_connection.additional_headers["X-Forwarded-Proto"] == "http"
     assert DummyWebSocketsModule.last_connection.additional_headers["X-Forwarded-Host"] == "testserver"
+
+
+def test_session_login_bootstraps_upstream_with_fixed_anthropic_key() -> None:
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    public_jwk = public_jwk_from_key(private_key.public_key())
+    settings = build_settings(
+        owner_public_key_jwk=public_jwk,
+        upstream_base_url="http://example-upstream",
+        openclaw_bootstrap_base_url="http://bootstrap",
+        challenge_ttl_seconds=60,
+        session_ttl_seconds=300,
+        session_cookie_name="proxy-session",
+    )
+    client = TestClient(create_app(settings))
+    request_body = '{"bootstrap_env":{"ANTHROPIC_API_KEY":"test-anthropic-key"}}'
+    headers = auth_headers(
+        client,
+        private_key,
+        method="POST",
+        path="/api/private/session/login",
+        body=request_body,
+    )
+
+    response = client.post(
+        "/api/private/session/login",
+        headers={**headers, "content-type": "application/json"},
+        content=request_body,
+    )
+
+    assert response.status_code == 200
+    assert len(DummyAsyncClient.requests) == 1
+    assert DummyAsyncClient.requests[0]["url"] == "http://bootstrap/api/bootstrap/config"
+    assert DummyAsyncClient.requests[0]["content"] == b'{"env":{"ANTHROPIC_API_KEY":"test-anthropic-key"}}'
+
+
+def test_authenticated_proxy_request_requires_bootstrap_first() -> None:
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    public_jwk = public_jwk_from_key(private_key.public_key())
+    settings = build_settings(
+        owner_public_key_jwk=public_jwk,
+        upstream_base_url="http://example-upstream",
+        openclaw_bootstrap_base_url="http://bootstrap",
+        challenge_ttl_seconds=60,
+        session_ttl_seconds=300,
+        session_cookie_name="proxy-session",
+    )
+    client = TestClient(create_app(settings))
+    headers = auth_headers(
+        client,
+        private_key,
+        method="GET",
+        path="/openclaw/__openclaw/control-ui-config.json",
+    )
+
+    response = client.get("/openclaw/__openclaw/control-ui-config.json", headers=headers)
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "upstream bootstrap has not completed; initialize the session first"
+
+
+def test_private_bootstrap_endpoint_accepts_signed_client_env() -> None:
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    public_jwk = public_jwk_from_key(private_key.public_key())
+    settings = build_settings(
+        owner_public_key_jwk=public_jwk,
+        upstream_base_url="http://example-upstream",
+        openclaw_bootstrap_base_url="http://bootstrap",
+        challenge_ttl_seconds=60,
+        session_ttl_seconds=300,
+        session_cookie_name="proxy-session",
+    )
+    client = TestClient(create_app(settings))
+    request_body = '{"env":{"ANTHROPIC_API_KEY":"abc"}}'
+    headers = auth_headers(
+        client,
+        private_key,
+        method="POST",
+        path="/api/private/bootstrap",
+        body=request_body,
+    )
+
+    response = client.post("/api/private/bootstrap", headers=headers, content=request_body)
+
+    assert response.status_code == 200
+    assert response.json()["bootstrapped"] is True
+    assert DummyAsyncClient.requests[0]["url"] == "http://bootstrap/api/bootstrap/config"
+    assert DummyAsyncClient.requests[0]["content"] == b'{"env":{"ANTHROPIC_API_KEY":"abc"}}'
 
 
 def test_public_websocket_bypasses_auth() -> None:

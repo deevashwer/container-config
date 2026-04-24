@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import re
 import ssl
 import sys
@@ -139,6 +140,7 @@ class OwnerState:
     owner_private_jwk: dict[str, str]
     owner_public_jwk: dict[str, str]
     owner_key_id: str
+    bootstrap_env: dict[str, str] | None = None
     state_root: str | None = None
     state_generation: int = 0
 
@@ -158,6 +160,7 @@ class StateStore:
             owner_private_jwk=data["owner_private_jwk"],
             owner_public_jwk=data["owner_public_jwk"],
             owner_key_id=data["owner_key_id"],
+            bootstrap_env=data.get("bootstrap_env") or {},
             state_root=data.get("state_root"),
             state_generation=int(data.get("state_generation", 0)),
         )
@@ -166,7 +169,7 @@ class StateStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(asdict(state), indent=2) + "\n")
 
-    def create(self, *, force: bool = False) -> OwnerState:
+    def create(self, *, force: bool = False, bootstrap_env: dict[str, str] | None = None) -> OwnerState:
         if self.path.exists() and not force:
             raise FileExistsError(f"state file already exists: {self.path}")
         private_key = ec.generate_private_key(ec.SECP256R1())
@@ -176,6 +179,7 @@ class StateStore:
             owner_private_jwk=private_jwk,
             owner_public_jwk=public_jwk,
             owner_key_id=key_id_from_public_jwk(public_jwk),
+            bootstrap_env=bootstrap_env or {},
         )
         self.save(state)
         return state
@@ -511,6 +515,7 @@ class OwnerAuthProxyClient:
         self.transport = transport
         self.state = state
         self.public_config: dict[str, Any] | None = None
+        self._upstream_bootstrapped = False
 
     def load_public_config(self) -> dict[str, Any]:
         response = self.transport.request("GET", "/api/public/config")
@@ -541,6 +546,8 @@ class OwnerAuthProxyClient:
     ) -> httpx.Response:
         if json_body is not None and raw_body is not None:
             raise ValueError("provide either json_body or raw_body, not both")
+        if path not in {"/api/private/bootstrap", "/api/private/session/login"}:
+            self.bootstrap_upstream()
 
         body = raw_body
         if json_body is not None:
@@ -594,6 +601,18 @@ class OwnerAuthProxyClient:
             content=body or None,
         )
 
+    def bootstrap_upstream(self) -> dict[str, Any]:
+        if self._upstream_bootstrapped:
+            return {"bootstrapped": True, "env_keys": sorted((self.state.bootstrap_env or {}).keys())}
+        response = self.authenticated_request(
+            "POST",
+            "/api/private/bootstrap",
+            json_body={"env": self.state.bootstrap_env or {}},
+        )
+        response.raise_for_status()
+        self._upstream_bootstrapped = True
+        return response.json()
+
     def get_json(self, path: str) -> dict[str, Any]:
         response = self.authenticated_request("GET", path)
         response.raise_for_status()
@@ -604,13 +623,32 @@ class OwnerAuthProxyClient:
         response.raise_for_status()
         return response.json()
 
+    def login_session(self) -> dict[str, Any]:
+        response = self.authenticated_request(
+            "POST",
+            "/api/private/session/login",
+            json_body={"bootstrap_env": self.state.bootstrap_env or {}},
+        )
+        response.raise_for_status()
+        self._upstream_bootstrapped = True
+        return response.json()
+
 
 # The CLI stays thin on purpose: load state, choose transport, then delegate to
 # the shared client so local and verified modes behave the same way.
 def print_state_summary(state: OwnerState, state_path: Path) -> None:
     print(f"state_path={state_path}")
     print(f"owner_key_id={state.owner_key_id}")
+    bootstrap_keys = sorted((state.bootstrap_env or {}).keys())
+    print("bootstrap_env_keys=" + ",".join(bootstrap_keys or ["none"]))
     print("OWNER_PUBLIC_KEY_JWK=" + json.dumps(state.owner_public_jwk, separators=(",", ":")))
+
+
+def resolve_bootstrap_env(args: argparse.Namespace) -> dict[str, str]:
+    value = (args.anthropic_api_key or os.getenv("ANTHROPIC_API_KEY") or "").strip()
+    if not value:
+        return {}
+    return {"ANTHROPIC_API_KEY": value}
 
 
 def jsonable(value: Any) -> Any:
@@ -668,7 +706,7 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
         print_state_summary(state, state_path)
         return 0
 
-    state = store.create(force=args.force)
+    state = store.create(force=args.force, bootstrap_env=resolve_bootstrap_env(args))
     print_state_summary(state, state_path)
     return 0
 
@@ -828,6 +866,7 @@ def build_parser() -> argparse.ArgumentParser:
     bootstrap = subparsers.add_parser("bootstrap", help="generate or print the local owner key state")
     bootstrap.add_argument("--state-file", default=str(DEFAULT_STATE_PATH))
     bootstrap.add_argument("--force", action="store_true")
+    bootstrap.add_argument("--anthropic-api-key", default="")
     bootstrap.set_defaults(func=cmd_bootstrap)
 
     for name, help_text, handler in [

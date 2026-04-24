@@ -12,22 +12,20 @@ services:
       SESSION_COOKIE_SECURE: "false"
       OPENCLAW_WORKSPACE_PATH: "/openclaw/"
       OWNER_PUBLIC_KEY_JWK: ${OWNER_PUBLIC_KEY_JWK}
+      OPENCLAW_BOOTSTRAP_BASE_URL: http://127.0.0.1:18788
       UPSTREAM_BASE_URL: http://127.0.0.1:18789
+      AUX_APPLICATION_BASE_URL: http://127.0.0.1:3000
+      AUX_APPLICATION_PATH_PREFIX: /aux-application
+      BOOTSTRAP_TIMEOUT_SECONDS: "90"
     depends_on:
       - openclaw
 
   openclaw:
-    image: ghcr.io/openclaw/openclaw:2026.4.15-slim@sha256:734b55459a9d2eddd58a493577e1ff867a2680f13758349529bec91a0d2c0ea3
+    build:
+      context: ./openclaw-runtime
+      dockerfile: Dockerfile
     ports:
       - "8080:8080"
-    entrypoint:
-      - sh
-      - -lc
     environment:
       OPENCLAW_DISABLE_BONJOUR: "1"
-    command:
-      - >-
-        set -eu;
-        mkdir -p /home/node/.openclaw &&
-        node -e 'const fs = require("node:fs"); const config = { gateway: { mode: "local", bind: "loopback", trustedProxies: ["127.0.0.1", "::1"], controlUi: { basePath: "/openclaw", embedSandbox: "strict", allowedOrigins: ["*"], dangerouslyDisableDeviceAuth: true }, auth: { mode: "none" } } }; fs.writeFileSync("/home/node/.openclaw/openclaw.json", JSON.stringify(config)); console.log("[openclaw-local] bind=loopback auth_mode=none origin_checks=disabled");' &&
-        exec docker-entrypoint.sh node openclaw.mjs gateway --allow-unconfigured
+      OPENCLAW_BOOTSTRAP_WAIT_MS: "90000"

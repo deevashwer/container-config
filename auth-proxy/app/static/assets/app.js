@@ -62,6 +62,9 @@ function renderOwnerSummary(ownerState, config) {
     <p class="owner-summary-copy">
       ${ownerState.persisted ? "Saved in this browser." : "Held only for this browser session."}
     </p>
+    <p class="owner-summary-copy">
+      Bootstrap env keys: ${Object.keys(ownerState.bootstrapEnv || {}).join(", ") || "none"}
+    </p>
   `;
 }
 

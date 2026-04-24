@@ -2,7 +2,7 @@
 
 This repo is intentionally reduced to the current working shape:
 
-- `openclaw` runs the official image on loopback only
+- `openclaw` runs a custom runtime image built on the official image
 - `auth-proxy` is the only public ingress
 - `python_client` remains available for `bootstrap`, `verify`, `request`, `chat`, and `serve`
 
@@ -15,17 +15,24 @@ browser or python_client
     auth-proxy :8080
           |
           v
- openclaw 127.0.0.1:18789
+ openclaw bootstrap 127.0.0.1:18788
+          |
+          v
+ openclaw gateway 127.0.0.1:18789
 ```
 
 ## OpenClaw
 
-OpenClaw is configured at container start with:
+The runtime image starts a small loopback-only bootstrap server first. Auth-proxy receives `bootstrap_env` from the authenticated init request, forwards it to the bootstrap server, and only then does the bootstrap server launch OpenClaw.
+
+OpenClaw is still configured with:
 
 - `gateway.mode = "local"`
 - `gateway.bind = "loopback"`
 - `gateway.auth.mode = "none"`
 - `gateway.controlUi.basePath = "/openclaw"`
+- `agents.defaults.model.primary = "anthropic/claude-sonnet-4-6"`
+- `agents.defaults.model.fallbacks = ["anthropic/claude-opus-4-6"]`
 
 Because OpenClaw only listens on loopback behind the proxy, its Control UI origin checks are relaxed for now.
 
@@ -38,14 +45,16 @@ The auth proxy owns:
 - `POST /api/public/challenge`
 - session creation and logout under `/api/private/session*`
 - authenticated HTTP and WebSocket forwarding for everything else
+- path-based forwarding of `/aux-application/*` to an in-enclave service on `127.0.0.1:3000`
 
 The browser flow is:
 
 1. load owner state JSON
 2. request a one-time challenge
-3. sign it locally
-4. mint the browser session cookie
-5. redirect to `/openclaw/`
+3. sign the init request locally, including `bootstrap_env`
+4. bootstrap OpenClaw inside the enclave
+5. mint the browser session cookie
+6. redirect to `/openclaw/`
 
 ## Python Client
 

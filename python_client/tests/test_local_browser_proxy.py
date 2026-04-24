@@ -69,12 +69,10 @@ class FakeOwnerClient:
     def ensure_owner_key_matches(self) -> None:
         self.ensure_calls += 1
 
-    def authenticated_request(self, method: str, path: str) -> httpx.Response:
-        assert method == "POST"
-        assert path == "/api/private/session/login"
+    def login_session(self) -> dict[str, object]:
         self.login_calls += 1
         self.transport.client.cookies.set("openclaw_owner_session", "session-cookie")
-        return httpx.Response(200, json={"authenticated": True}, request=httpx.Request("POST", f"{self.transport.base_url}{path}"))
+        return {"authenticated": True}
 
 
 @dataclass

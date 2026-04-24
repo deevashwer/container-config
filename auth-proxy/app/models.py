@@ -35,3 +35,11 @@ class SessionResponse(BaseModel):
     key_id: str | None
     auth_kind: str | None
     expires_at: datetime | None = None
+
+
+class UpstreamBootstrapRequest(BaseModel):
+    env: dict[str, str] = Field(default_factory=dict)
+
+
+class SessionLoginRequest(BaseModel):
+    bootstrap_env: dict[str, str] = Field(default_factory=dict)

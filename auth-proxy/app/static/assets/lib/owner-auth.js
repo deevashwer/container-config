@@ -83,10 +83,19 @@ function buildSigningPayload({ challengeId, nonce, method, path, bodySha256, exp
 }
 
 function normalizeOwnerStateShape(payload) {
+  const bootstrapEnv =
+    payload?.bootstrap_env && typeof payload.bootstrap_env === "object" && !Array.isArray(payload.bootstrap_env)
+      ? Object.fromEntries(
+          Object.entries(payload.bootstrap_env)
+            .map(([key, value]) => [String(key), String(value ?? "").trim()])
+            .filter(([, value]) => value),
+        )
+      : {};
   if (payload?.owner_private_jwk) {
     const ownerPrivateJwk = sanitizePrivateJwk(payload.owner_private_jwk);
     const ownerPublicJwk = sanitizePublicJwk(payload.owner_public_jwk ?? payload.owner_private_jwk);
     return {
+      bootstrapEnv,
       ownerPrivateJwk,
       ownerPublicJwk,
       ownerKeyId: payload.owner_key_id || null,
@@ -98,6 +107,7 @@ function normalizeOwnerStateShape(payload) {
   const ownerPrivateJwk = sanitizePrivateJwk(payload);
   const ownerPublicJwk = sanitizePublicJwk(payload);
   return {
+    bootstrapEnv,
     ownerPrivateJwk,
     ownerPublicJwk,
     ownerKeyId: null,
@@ -291,7 +301,9 @@ export class OwnerAuthBrowserClient {
   }
 
   async login(ownerState) {
-    const response = await this.sendSignedRequest(ownerState, "POST", "/api/private/session/login");
+    const response = await this.sendSignedRequest(ownerState, "POST", "/api/private/session/login", {
+      jsonBody: { bootstrap_env: ownerState.bootstrapEnv || {} },
+    });
     if (!response.ok) {
       throw responseError(response.status, await response.text());
     }
