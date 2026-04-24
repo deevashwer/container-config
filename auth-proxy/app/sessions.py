@@ -17,7 +17,7 @@ class SessionError(ValueError):
 @dataclass(slots=True)
 class StoredSession:
     session_id: str
-    key_id: str
+    credential_id: str
     issued_at: datetime
     expires_at: datetime
 
@@ -28,11 +28,11 @@ class InMemorySessionStore:
         self._lock = asyncio.Lock()
         self._sessions: dict[str, StoredSession] = {}
 
-    async def issue(self, *, key_id: str) -> StoredSession:
+    async def issue(self, *, credential_id: str) -> StoredSession:
         now = utc_now()
         session = StoredSession(
             session_id=secrets.token_urlsafe(32),
-            key_id=key_id,
+            credential_id=credential_id,
             issued_at=now,
             expires_at=now + timedelta(seconds=self._ttl_seconds),
         )

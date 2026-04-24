@@ -3,10 +3,8 @@
 Minimal setup:
 
 - `openclaw`: custom runtime image with a loopback bootstrap server
-- `auth-proxy`: only public ingress
-- `python_client`: local owner-auth, verification, and browser-gateway tooling
-
-Architecture and trust-path diagrams live in [`docs/stateful-openclaw-design.md`](docs/stateful-openclaw-design.md).
+- `auth-proxy`: public ingress plus one-time enclave initialization and server-side passkey verification
+- `python_client`: local verifier/launcher for the remote passkey flow
 
 ## Files
 
@@ -14,89 +12,67 @@ Architecture and trust-path diagrams live in [`docs/stateful-openclaw-design.md`
 - [`tinfoil-config.yml`](tinfoil-config.yml): Tinfoil deployment config
 - [`openclaw-runtime/`](openclaw-runtime): custom OpenClaw wrapper image
 - [`auth-proxy/`](auth-proxy): FastAPI proxy and browser unlock page
-- [`python_client/`](python_client): local client for `bootstrap`, `verify`, `request`, `chat`, and `serve`
+- [`python_client/`](python_client): local verification center and launcher for remote passkey auth
+- [`docs/persistent-storage-sidecar-challenges.md`](docs/persistent-storage-sidecar-challenges.md): design constraints for a storage-managing sidecar
 
 ## Local Stack
 
-Create owner state:
-
-```bash
-ANTHROPIC_API_KEY=your-key-here \
-python3 python_client/owner_auth_chat.py bootstrap \
-  --state-file /tmp/openclaw-owner-state.json \
-  --force
-```
-
-Copy the printed `OWNER_PUBLIC_KEY_JWK=...` into `.env`, then start:
+Start the local stack:
 
 ```bash
 docker compose up --build
 ```
 
-Use:
+Use the browser unlock flow at `http://localhost:8080/`.
 
-- browser unlock flow: `http://127.0.0.1:8080/`
-- direct verify:
+First run:
 
-```bash
-python3 python_client/owner_auth_chat.py verify \
-  --mode local \
-  --state-file /tmp/openclaw-owner-state.json \
-  --base-url http://127.0.0.1:8080
-```
+1. Enter `ANTHROPIC_API_KEY` if the upstream bootstrap requires it.
+2. Click `Initialize enclave and enter OpenClaw`.
+3. Approve the passkey.
 
-- direct signed request:
+After that:
 
-```bash
-python3 python_client/owner_auth_chat.py request \
-  --mode local \
-  --state-file /tmp/openclaw-owner-state.json \
-  --base-url http://127.0.0.1:8080 \
-  GET /openclaw/__openclaw/control-ui-config.json
-```
+- the enclave is claimed and `/api/public/init/*` is no longer usable
+- the server authenticates the browser with WebAuthn/passkeys
+- the browser reuses the saved local bootstrap env after passkey approval
+- later visits only need passkey approval unless you clear the local vault
 
-## Verified Local Browser Gateway
+Important local notes:
 
-Use this when you want local Python to:
+- use `localhost`, not `127.0.0.1`, for the browser passkey flow
+- server-side passkeys are stored at `PASSKEY_STORE_PATH`
+- the local bootstrap env vault is browser-local IndexedDB storage
 
-- verify Tinfoil attestation
-- pin the upstream TLS key
-- hold the owner state locally
-- keep the remote session cookie out of the browser
-- serve a local landing page before opening OpenClaw
+Specifically:
 
-Example against the deployed smoke test:
+- IndexedDB database: `openclaw.auth-proxy.keystore.v2`
+- object store: `vault`
+- entries: `vaultKey`, `vaultCiphertext`, `vaultMeta`
 
-```bash
-python3 python_client/owner_auth_chat.py serve \
-  --mode tinfoil \
-  --state-file /tmp/openclaw-owner-state.json \
-  --enclave openclaw-smoke-test.devesh-org.containers.tinfoil.dev \
-  --repo deevashwer/container-config \
-  --release-tag v0.0.8 \
-  --host 127.0.0.1 \
-  --port 8090 \
-  --open-browser
-```
+## Deployment Notes
 
-What happens:
+- `auth-proxy` starts generic; the first successful passkey initialization claims it
+- the auth proxy now persists passkey credentials at `PASSKEY_STORE_PATH`
+- if you want passkeys to survive container recreation locally, keep the compose volume mounted
+- the browser still owns `ANTHROPIC_API_KEY`; the proxy only receives it during initialization/login when upstream bootstrap is still needed
 
-1. Python verifies the remote enclave and release measurement.
-2. Python signs the owner-auth login with the local state.
-3. Python keeps the upstream session cookie locally.
-4. Browser opens `http://127.0.0.1:8090/`.
-5. Browser traffic continues through the local gateway to the verified remote enclave.
+## Python Client
 
-Important:
+`python_client/owner_auth_chat.py` no longer performs direct authenticated requests. That old model depended on a local owner private key, which no longer exists.
 
-- keep using the `localhost` URL for the verified demo
-- do not switch the browser over to the remote Tinfoil URL after verification
+Current commands:
 
-Useful local endpoints while `serve` is running:
+- `verify`: fetch `/api/public/config` and print attestation details when available
+- `serve`: run a localhost verification center that links into the real remote unlock page
+- `bootstrap`: print where secret state lives now and optionally purge the old `~/.config/openclaw-owner-chat/state.json`
 
-- landing page: `http://127.0.0.1:8090/`
-- raw local status: `http://127.0.0.1:8090/api/local/status`
-- proxied OpenClaw UI: `http://127.0.0.1:8090/openclaw/`
+The browser remains the owner of `ANTHROPIC_API_KEY` in this model. `python_client` does not persist that secret anymore.
+
+Current gap:
+
+- the local Python verifier can carry its expected TLS and HPKE key fingerprints into the remote unlock page as a continuity hint
+- the browser page does not yet cryptographically confirm that the later browser connection used those same attested keys
 
 ## Aux Application Demo
 
@@ -108,9 +84,27 @@ An auxiliary HTTP app listening inside the enclave on `127.0.0.1:3000` is expose
 
 That path is forwarded by `auth-proxy`; no second public shim port is required.
 
+## Verification Status
+
+The browser unlock flow is now passkey-only on the server side. Verified locally:
+
+- `python3 -m pytest auth-proxy/tests/test_app.py -q`
+- local HTTP smoke for `GET /healthz`
+- local HTTP smoke for `GET /api/public/config`
+- local HTTP smoke for `POST /api/public/init/options`
+
+Browser automation coverage for the passkey approval flow is still pending.
+
 ## Releases
 
 Current published release used by `tinfoil-config.yml`:
 
 - `ghcr.io/deevashwer/openclaw-auth-proxy:v0.0.8@sha256:c0910cc904d38f1c74ef12caa37ce0a6bfc8435dacd589b3fda40ee1dc0aba98`
 - `ghcr.io/deevashwer/openclaw-runtime:v0.0.8@sha256:737356a7410c69e68c932d413b78ed282d18025ab3777a0f79492b633c15fb9d`
+
+Tag push automation:
+
+- pushing a `v*` tag now publishes both GHCR images automatically
+- the workflow then renders a release-specific `tinfoil-config.yml` with the new image digests
+- Tinfoil attestation artifacts are generated from that rendered config and uploaded to the GitHub release
+- after a successful release, the workflow also updates the tracked `tinfoil-config.yml` and release refs in `README.md` on the default branch

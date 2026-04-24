@@ -1,16 +1,9 @@
 from __future__ import annotations
 
-import json
 import os
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any
 from urllib.parse import urlsplit
-
-from cryptography.hazmat.primitives.asymmetric import ec
-
-from .security import key_id_from_public_jwk, public_key_from_jwk
-
 
 DEFAULT_PUBLIC_PATH_PATTERNS = (
     "/",
@@ -25,9 +18,6 @@ DEFAULT_PUBLIC_PATH_PATTERNS = (
 class Settings:
     app_name: str
     port: int
-    owner_public_key_jwk: dict[str, Any] | None
-    owner_public_key: ec.EllipticCurvePublicKey | None
-    owner_key_id: str | None
     challenge_ttl_seconds: int
     upstream_base_url: str | None
     aux_application_base_url: str | None
@@ -42,11 +32,13 @@ class Settings:
     session_cookie_secure: bool
     session_cookie_samesite: str
     openclaw_workspace_path: str
+    passkey_store_path: str
+    passkey_rp_id: str | None
+    passkey_rp_name: str
 
 
 def build_settings(
     *,
-    owner_public_key_jwk: dict[str, Any] | None,
     upstream_base_url: str | None,
     aux_application_base_url: str | None = None,
     aux_application_path_prefix: str | None = "/aux-application",
@@ -59,17 +51,14 @@ def build_settings(
     bootstrap_timeout_seconds: float = 90.0,
     public_path_patterns: tuple[str, ...] = DEFAULT_PUBLIC_PATH_PATTERNS,
     session_ttl_seconds: int = 60 * 60 * 12,
-    session_cookie_name: str = "openclaw_owner_session",
+    session_cookie_name: str = "openclaw_passkey_session",
     session_cookie_secure: bool = False,
     session_cookie_samesite: str = "lax",
     openclaw_workspace_path: str = "/openclaw/",
+    passkey_store_path: str = "/tmp/openclaw-passkeys.json",
+    passkey_rp_id: str | None = None,
+    passkey_rp_name: str | None = None,
 ) -> Settings:
-    owner_public_key = None
-    owner_key_id = None
-    if owner_public_key_jwk is not None:
-        owner_public_key = public_key_from_jwk(owner_public_key_jwk)
-        owner_key_id = key_id_from_public_jwk(owner_public_key_jwk)
-
     resolved_upstream_origin = upstream_origin
     if resolved_upstream_origin is None and upstream_base_url:
         parts = urlsplit(upstream_base_url)
@@ -79,9 +68,6 @@ def build_settings(
     return Settings(
         app_name=app_name,
         port=port,
-        owner_public_key_jwk=owner_public_key_jwk,
-        owner_public_key=owner_public_key,
-        owner_key_id=owner_key_id,
         challenge_ttl_seconds=challenge_ttl_seconds,
         upstream_base_url=upstream_base_url,
         aux_application_base_url=aux_application_base_url,
@@ -98,13 +84,10 @@ def build_settings(
         session_cookie_secure=session_cookie_secure,
         session_cookie_samesite=session_cookie_samesite,
         openclaw_workspace_path=openclaw_workspace_path,
+        passkey_store_path=passkey_store_path,
+        passkey_rp_id=passkey_rp_id.strip() or None if passkey_rp_id else None,
+        passkey_rp_name=(passkey_rp_name or app_name).strip() or app_name,
     )
-
-
-def _parse_optional_json(raw_value: str | None) -> dict[str, Any] | None:
-    if not raw_value:
-        return None
-    return json.loads(raw_value)
 
 
 def _parse_bool(raw_value: str | None, default: bool) -> bool:
@@ -133,7 +116,6 @@ def get_settings() -> Settings:
     return build_settings(
         app_name=os.getenv("APP_NAME", "OpenClaw Auth Proxy"),
         port=int(os.getenv("PORT", "8080")),
-        owner_public_key_jwk=_parse_optional_json(os.getenv("OWNER_PUBLIC_KEY_JWK")),
         upstream_base_url=upstream_base_url or None,
         aux_application_base_url=os.getenv("AUX_APPLICATION_BASE_URL", "").strip() or None,
         aux_application_path_prefix=os.getenv("AUX_APPLICATION_PATH_PREFIX", "/aux-application").strip() or "/aux-application",
@@ -144,8 +126,12 @@ def get_settings() -> Settings:
         bootstrap_timeout_seconds=float(os.getenv("BOOTSTRAP_TIMEOUT_SECONDS", "90")),
         public_path_patterns=_parse_patterns(os.getenv("PUBLIC_PATH_PATTERNS")),
         session_ttl_seconds=int(os.getenv("SESSION_TTL_SECONDS", str(60 * 60 * 12))),
-        session_cookie_name=os.getenv("SESSION_COOKIE_NAME", "openclaw_owner_session").strip(),
+        session_cookie_name=os.getenv("SESSION_COOKIE_NAME", "openclaw_passkey_session").strip(),
         session_cookie_secure=_parse_bool(os.getenv("SESSION_COOKIE_SECURE"), False),
         session_cookie_samesite=os.getenv("SESSION_COOKIE_SAMESITE", "lax").strip().lower(),
         openclaw_workspace_path=os.getenv("OPENCLAW_WORKSPACE_PATH", "/openclaw/").strip() or "/openclaw/",
+        passkey_store_path=os.getenv("PASSKEY_STORE_PATH", "/tmp/openclaw-passkeys.json").strip()
+        or "/tmp/openclaw-passkeys.json",
+        passkey_rp_id=os.getenv("PASSKEY_RP_ID", "").strip() or None,
+        passkey_rp_name=os.getenv("PASSKEY_RP_NAME", "").strip() or None,
     )

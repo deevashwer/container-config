@@ -1,9 +1,9 @@
 # Stateful OpenClaw Design
 
-This repo has two operating modes:
+This repo now has two aligned operating modes:
 
 - the deployed two-container stack
-- the local verified Python browser gateway
+- the local Python verification center
 
 ## Two-Container Deployment
 
@@ -14,7 +14,8 @@ browser
 auth-proxy :8080
   |
   +--> /api/public/config
-  +--> /api/public/challenge
+  +--> /api/public/init/*
+  +--> /api/public/passkeys/authenticate/*
   +--> /api/private/session/*
   +--> /openclaw/*
   +--> /aux-application/*
@@ -31,10 +32,10 @@ openclaw gateway 127.0.0.1:18789
 `auth-proxy`
 
 - serves the unlock page at `/`
-- publishes the owner challenge endpoints
-- validates signed owner-auth requests
-- forwards `bootstrap_env` to the OpenClaw bootstrap server
-- issues the browser session cookie
+- starts generic and allows exactly one public initialization flow
+- verifies WebAuthn/passkey registration and assertion server-side
+- forwards `bootstrap_env` to the OpenClaw bootstrap server when upstream bootstrap is still needed
+- issues the browser session cookie after successful passkey auth
 - proxies HTTP and WebSocket traffic to OpenClaw
 - forwards `/aux-application/*` to `127.0.0.1:3000` inside the enclave
 
@@ -51,33 +52,41 @@ openclaw gateway 127.0.0.1:18789
 ### Browser Unlock Flow
 
 ```text
+fresh enclave:
 1. GET  /api/public/config
-2. POST /api/public/challenge
-3. browser signs exact request with owner private key
-4. POST /api/private/session/login { bootstrap_env }
+2. POST /api/public/init/options
+3. browser creates a passkey
+4. POST /api/public/init/finish { credential, bootstrap_env }
 5. auth-proxy bootstraps OpenClaw
-6. auth-proxy issues session cookie
+6. auth-proxy stores the passkey and issues a session cookie
 7. browser redirects to /openclaw/
+
+claimed enclave:
+1. GET  /api/public/config
+2. POST /api/public/passkeys/authenticate/options
+3. browser approves the saved passkey
+4. POST /api/public/passkeys/authenticate/finish { credential, bootstrap_env? }
+5. auth-proxy issues a session cookie
+6. browser redirects to /openclaw/
 ```
 
 ### Important Boundary
 
-This browser flow currently verifies:
+In the active browser flow:
 
-- server-configured `owner_key_id`
-- local owner state
-- challenge payload consistency
-- exact request signature
+- the passkey is verified on the server side
+- the browser-local vault stores `ANTHROPIC_API_KEY`
+- the proxy stores only the passkey credential material and browser session state
 
-It does **not** currently perform Tinfoil attestation verification in the browser.
+The browser vault is currently IndexedDB under:
 
-## Local Verified Python Browser Gateway
+- database: `openclaw.auth-proxy.keystore.v2`
+- object store: `vault`
+- entries: `vaultKey`, `vaultCiphertext`, `vaultMeta`
 
-This mode is for demos where the browser should not touch:
+## Local Python Verification Center
 
-- the owner private key
-- the upstream session cookie
-- the raw remote Tinfoil connection
+This mode exists to verify a remote Tinfoil deployment locally before the browser continues to the real enclave origin.
 
 ### Data Path
 
@@ -89,21 +98,21 @@ localhost python_client serve
   |
   +--> verifies Tinfoil attestation
   +--> pins upstream TLS key
-  +--> loads owner state
-  +--> signs owner-auth challenge
-  +--> stores upstream session cookie locally
+  +--> fetches remote public config
+  +--> renders local verification status
   |
   v
-remote auth-proxy on Tinfoil
+browser continues to remote auth-proxy origin
   |
-  v
-remote openclaw bootstrap
+  +--> passkey approval
+  +--> browser-local secret vault
+  +--> remote browser session cookie
   |
   v
 remote openclaw gateway
 ```
 
-### What the Local Gateway Does
+### What the Local Verification Center Does
 
 `VerifiedTinfoilTransport`
 
@@ -112,53 +121,48 @@ remote openclaw gateway
 - captures the attested TLS public key fingerprint
 - creates a TLS-pinned HTTP client for the remote enclave
 
-`AuthenticatedRemoteSession`
+`VerifiedLaunchSession`
 
 - loads remote public config
-- checks the remote `owner_key_id`
-- signs the owner-auth login locally
-- keeps the upstream session cookie in Python
-- retries upstream login on `401` when needed
+- records whether initialization is still available
+- exposes the remote unlock URL
 
 `create_browser_gateway_app()`
 
 - serves a local landing page at `/`
 - exposes `/api/local/status`
-- proxies browser HTTP and WebSocket requests onward
-- injects the upstream cookie itself
+- redirects `/launch` to the real remote unlock page
 
 ### User Experience
 
 ```text
 1. run python_client ... serve --mode tinfoil ...
-2. local landing page opens on localhost
+2. local verification center opens on localhost
 3. page shows:
    - attestation status
    - remote enclave URL
+   - passkey claim state
    - verification document
-   - explanation of the trust path
-4. user clicks "Open OpenClaw"
-5. browser continues using localhost only
-6. Python proxies all remote traffic through the verified connection
+4. user clicks "Open Remote Unlock Page"
+5. browser moves to the real remote enclave origin
+6. passkey auth and secret storage happen there
 ```
 
 ### Trust Model
 
 In this mode:
 
-- browser trusts the **local Python gateway**
-- Python verifies the **remote enclave**
-- all remote requests continue through Python
+- Python verifies the remote enclave
+- the browser still authenticates directly with the remote enclave origin
+- Python is not the authenticated proxy anymore
 
-This means the correct statement is:
+So the correct statement is:
 
-- “The local gateway verified the enclave and is proxying my browser traffic through that verified upstream connection.”
+- "Python verified the enclave locally, and then the browser continued to the real enclave origin for passkey auth."
 
-It is **not**:
+It is not:
 
-- “The browser now independently has a verified direct connection to the enclave.”
-
-If the browser leaves `localhost` and starts talking directly to the remote Tinfoil URL, this verified-local-gateway property is lost.
+- "Python authenticated to the enclave on the browser's behalf."
 
 ## Why `/aux-application/*` Exists
 
@@ -171,10 +175,3 @@ Tinfoil shim config is kept on a single public upstream port. Instead of exposin
 inside the enclave.
 
 That lets OpenClaw create or serve a demo app internally while keeping the external deployment shape simple.
-
-## Current Release
-
-`tinfoil-config.yml` is pinned to:
-
-- `ghcr.io/deevashwer/openclaw-auth-proxy:v0.0.8@sha256:c0910cc904d38f1c74ef12caa37ce0a6bfc8435dacd589b3fda40ee1dc0aba98`
-- `ghcr.io/deevashwer/openclaw-runtime:v0.0.8@sha256:737356a7410c69e68c932d413b78ed282d18025ab3777a0f79492b633c15fb9d`

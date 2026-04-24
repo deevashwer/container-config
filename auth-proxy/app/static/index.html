@@ -10,13 +10,11 @@
   <body>
     <main class="unlock-shell">
       <section class="unlock-card">
-        <p class="eyebrow">Owner-authenticated OpenClaw gateway</p>
+        <p class="eyebrow">Passkey-authenticated OpenClaw gateway</p>
         <h1>OpenClaw Secure Console</h1>
         <p class="lede">
-          Load the owner state JSON once. The page signs the proxy challenge,
-          sends the state bootstrap env through the authenticated init request,
-          creates the browser session, and then sends you directly to the real
-          OpenClaw chat.
+          A fresh enclave starts unclaimed. The first user can initialize it with a passkey and bootstrap
+          environment, then later visits only need passkey approval.
         </p>
 
         <div class="status-row">
@@ -24,35 +22,29 @@
           <span class="status-note" id="status-note">Waiting for proxy metadata.</span>
         </div>
 
-        <div class="action-stack">
-          <label class="primary-button" for="owner-state-file">Choose owner state file</label>
-          <input id="owner-state-file" type="file" accept=".json,application/json" hidden />
+        <div class="continuity-note" id="continuity-note" hidden></div>
 
-          <label class="remember-inline">
-            <input id="remember-state-toggle" type="checkbox" checked />
-            <span>Remember this key on this browser</span>
+        <div class="action-stack">
+          <label class="field">
+            <span>Anthropic API key stored in the local browser vault</span>
+            <input
+              id="anthropic-api-key"
+              type="password"
+              placeholder="sk-ant-..."
+              autocomplete="off"
+              spellcheck="false"
+            />
           </label>
 
-          <details class="paste-panel">
-            <summary>Paste JSON instead</summary>
-            <label class="field">
-              <span>Owner state JSON or raw private JWK</span>
-              <textarea
-                id="owner-state-json"
-                rows="9"
-                placeholder='{"owner_private_jwk": {...}, "owner_key_id": "..."}'
-              ></textarea>
-            </label>
-            <button class="secondary-button" id="load-json-button" type="button">
-              Unlock from pasted JSON
-            </button>
-          </details>
+          <button class="primary-button" id="primary-passkey-button" type="button">
+            Approve passkey
+          </button>
         </div>
 
-        <div class="owner-summary" id="owner-summary">
-          <p class="owner-summary-title">No owner key loaded</p>
+        <div class="owner-summary" id="setup-summary">
+          <p class="owner-summary-title">Checking setup state</p>
           <p class="owner-summary-copy">
-            Use the JSON created by <code>python_client/owner_auth_chat.py bootstrap --state-file ...</code>.
+            The gateway is checking whether this enclave has already been claimed.
           </p>
         </div>
 
@@ -68,16 +60,40 @@
               <dd id="config-challenge-ttl">-</dd>
             </div>
             <div>
-              <dt>Server owner key</dt>
-              <dd class="mono" id="config-owner-key-id">-</dd>
+              <dt>Ownership</dt>
+              <dd id="config-passkey-state">-</dd>
+            </div>
+            <div>
+              <dt>Passkey count</dt>
+              <dd id="config-passkey-count">-</dd>
             </div>
             <div>
               <dt>Workspace path</dt>
               <dd class="mono" id="config-workspace-path">-</dd>
             </div>
+            <div>
+              <dt>Passkey support</dt>
+              <dd id="passkey-support">Checking</dd>
+            </div>
+            <div>
+              <dt>Local vault</dt>
+              <dd id="local-vault-status">Checking</dd>
+            </div>
+            <div>
+              <dt>Continuity hint</dt>
+              <dd id="config-continuity-state">-</dd>
+            </div>
+            <div>
+              <dt>Expected TLS key</dt>
+              <dd class="mono" id="local-verified-tls-key">-</dd>
+            </div>
+            <div>
+              <dt>Expected HPKE key</dt>
+              <dd class="mono" id="local-verified-hpke-key">-</dd>
+            </div>
           </dl>
           <div class="details-actions">
-            <button class="ghost-button" id="clear-owner-state" type="button">Clear saved key</button>
+            <button class="ghost-button" id="clear-local-vault" type="button">Clear local vault</button>
             <button class="ghost-button" id="logout-session-button" type="button">Clear session</button>
           </div>
         </details>

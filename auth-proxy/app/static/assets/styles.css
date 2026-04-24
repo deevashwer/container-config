@@ -108,6 +108,20 @@ h1 {
   margin-bottom: 1.2rem;
 }
 
+.continuity-note {
+  margin-bottom: 1rem;
+  padding: 0.85rem 1rem;
+  border-radius: 1rem;
+  border: 1px solid rgba(244, 161, 88, 0.2);
+  background: rgba(244, 161, 88, 0.08);
+  color: var(--text-muted);
+  line-height: 1.6;
+}
+
+.continuity-note strong {
+  color: var(--text);
+}
+
 .status-pill {
   display: inline-flex;
   width: fit-content;
@@ -137,6 +151,12 @@ h1 {
 .action-stack {
   display: grid;
   gap: 0.9rem;
+}
+
+.action-row {
+  display: flex;
+  gap: 0.7rem;
+  flex-wrap: wrap;
 }
 
 .primary-button,
@@ -230,6 +250,19 @@ textarea {
   outline: none;
 }
 
+input[type="password"],
+input[type="text"] {
+  width: 100%;
+  border-radius: 1rem;
+  border: 1px solid rgba(149, 182, 198, 0.16);
+  background: rgba(3, 10, 15, 0.78);
+  color: var(--text);
+  padding: 0.9rem;
+  outline: none;
+}
+
+input[type="password"]:focus,
+input[type="text"]:focus,
 textarea:focus {
   border-color: rgba(101, 208, 206, 0.44);
   box-shadow: 0 0 0 3px rgba(101, 208, 206, 0.1);
@@ -286,6 +319,14 @@ textarea:focus {
 
   .details-actions {
     flex-direction: column;
+  }
+
+  .action-row {
+    flex-direction: column;
+  }
+
+  .action-row > * {
+    width: 100%;
   }
 
   .details-actions > * {

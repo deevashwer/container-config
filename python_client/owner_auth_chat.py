@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import json
-import os
 import re
 import ssl
 import sys
@@ -16,28 +14,15 @@ from typing import Any
 import httpx
 import requests
 from cryptography import x509
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 
-DEFAULT_STATE_PATH = Path.home() / ".config" / "openclaw-owner-chat" / "state.json"
+LEGACY_STATE_PATH = Path.home() / ".config" / "openclaw-owner-chat" / "state.json"
 GITHUB_PROXY = "https://github-proxy.tinfoil.sh"
 
 
 def eprint(message: str) -> None:
     print(message, file=sys.stderr)
-
-
-# Keep the owner key in portable JWK form so the same state file can work for
-# local HTTP now and a future passkey-backed flow later.
-def base64url_encode(value: bytes) -> str:
-    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
-
-
-def base64url_decode(value: str) -> bytes:
-    padding = "=" * ((4 - len(value) % 4) % 4)
-    return base64.urlsafe_b64decode(value + padding)
 
 
 def sha256_hex(value: bytes | str) -> str:
@@ -46,151 +31,10 @@ def sha256_hex(value: bytes | str) -> str:
     return sha256(value).hexdigest()
 
 
-def sanitize_public_jwk(jwk: dict[str, Any]) -> dict[str, str]:
-    required_keys = {"crv", "kty", "x", "y"}
-    missing = required_keys.difference(jwk)
-    if missing:
-        raise ValueError(f"missing public JWK fields: {sorted(missing)}")
-    sanitized = {key: str(jwk[key]) for key in sorted(required_keys)}
-    if sanitized["kty"] != "EC" or sanitized["crv"] != "P-256":
-        raise ValueError("only EC P-256 JWK keys are supported")
-    return sanitized
-
-
-def sanitize_private_jwk(jwk: dict[str, Any]) -> dict[str, str]:
-    sanitized = sanitize_public_jwk(jwk)
-    if "d" not in jwk:
-        raise ValueError("missing private JWK field: d")
-    sanitized["d"] = str(jwk["d"])
-    return sanitized
-
-
-def canonical_public_jwk_json(jwk: dict[str, Any]) -> str:
-    return json.dumps(sanitize_public_jwk(jwk), sort_keys=True, separators=(",", ":"))
-
-
-def key_id_from_public_jwk(jwk: dict[str, Any]) -> str:
-    return sha256_hex(canonical_public_jwk_json(jwk))
-
-
-def public_jwk_from_key(public_key: ec.EllipticCurvePublicKey) -> dict[str, str]:
-    numbers = public_key.public_numbers()
-    x = numbers.x.to_bytes(32, "big")
-    y = numbers.y.to_bytes(32, "big")
-    return {
-        "crv": "P-256",
-        "kty": "EC",
-        "x": base64url_encode(x),
-        "y": base64url_encode(y),
-    }
-
-
-def private_jwk_from_key(private_key: ec.EllipticCurvePrivateKey) -> dict[str, str]:
-    public_jwk = public_jwk_from_key(private_key.public_key())
-    d = private_key.private_numbers().private_value.to_bytes(32, "big")
-    return {
-        **public_jwk,
-        "d": base64url_encode(d),
-    }
-
-
-def private_key_from_jwk(jwk: dict[str, Any]) -> ec.EllipticCurvePrivateKey:
-    sanitized = sanitize_private_jwk(jwk)
-    d = int.from_bytes(base64url_decode(sanitized["d"]), "big")
-    x = int.from_bytes(base64url_decode(sanitized["x"]), "big")
-    y = int.from_bytes(base64url_decode(sanitized["y"]), "big")
-    public_numbers = ec.EllipticCurvePublicNumbers(x, y, ec.SECP256R1())
-    private_numbers = ec.EllipticCurvePrivateNumbers(d, public_numbers)
-    return private_numbers.private_key()
-
-
-# The client re-derives the canonical payload locally before signing so it does
-# not blindly trust the challenge response body from the proxy.
-def build_signing_payload(
-    *,
-    challenge_id: str,
-    nonce: str,
-    method: str,
-    path: str,
-    body_sha256: str,
-    expires_at: str,
-) -> str:
-    payload = {
-        "body_sha256": body_sha256,
-        "challenge_id": challenge_id,
-        "expires_at": expires_at,
-        "method": method.upper(),
-        "nonce": nonce,
-        "path": path,
-        "version": "openclaw-owner-auth-v1",
-    }
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
-
-
-def sign_payload(private_jwk: dict[str, Any], payload: str) -> str:
-    private_key = private_key_from_jwk(private_jwk)
-    signature = private_key.sign(payload.encode("utf-8"), ec.ECDSA(hashes.SHA256()))
-    return base64url_encode(signature)
-
-
-# This is the whole local client state for now. `state_root` and
-# `state_generation` are placeholders for the later persistence work.
-@dataclass
-class OwnerState:
-    owner_private_jwk: dict[str, str]
-    owner_public_jwk: dict[str, str]
-    owner_key_id: str
-    bootstrap_env: dict[str, str] | None = None
-    state_root: str | None = None
-    state_generation: int = 0
-
-
-class StateStore:
-    def __init__(self, path: Path) -> None:
-        self.path = path
-
-    def exists(self) -> bool:
-        return self.path.exists()
-
-    def load(self) -> OwnerState:
-        if not self.path.exists():
-            raise FileNotFoundError(f"state file not found: {self.path}")
-        data = json.loads(self.path.read_text())
-        return OwnerState(
-            owner_private_jwk=data["owner_private_jwk"],
-            owner_public_jwk=data["owner_public_jwk"],
-            owner_key_id=data["owner_key_id"],
-            bootstrap_env=data.get("bootstrap_env") or {},
-            state_root=data.get("state_root"),
-            state_generation=int(data.get("state_generation", 0)),
-        )
-
-    def save(self, state: OwnerState) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(asdict(state), indent=2) + "\n")
-
-    def create(self, *, force: bool = False, bootstrap_env: dict[str, str] | None = None) -> OwnerState:
-        if self.path.exists() and not force:
-            raise FileExistsError(f"state file already exists: {self.path}")
-        private_key = ec.generate_private_key(ec.SECP256R1())
-        public_jwk = public_jwk_from_key(private_key.public_key())
-        private_jwk = private_jwk_from_key(private_key)
-        state = OwnerState(
-            owner_private_jwk=private_jwk,
-            owner_public_jwk=public_jwk,
-            owner_key_id=key_id_from_public_jwk(public_jwk),
-            bootstrap_env=bootstrap_env or {},
-        )
-        self.save(state)
-        return state
-
-
 class TransportError(RuntimeError):
     pass
 
 
-# Everything above the transport layer stays the same whether we are talking to
-# localhost or to an attested Tinfoil hostname.
 class BaseTransport:
     def request(
         self,
@@ -234,8 +78,6 @@ class LocalTransport(BaseTransport):
         self.client.close()
 
 
-# These helpers mirror the SDK's TLS pinning behavior so the manual verifier can
-# still bind the HTTP client to the attested enclave certificate.
 def verify_peer_public_key_fingerprint(cert_binary: bytes | None, expected_fp: str) -> None:
     if not cert_binary:
         raise ValueError("no TLS certificate found")
@@ -274,9 +116,6 @@ def coerce_predicate_type(value: Any) -> Any:
         raise ValueError(f"unsupported predicate type: {value}") from exc
 
 
-# Accept a few simple JSON shapes so the verification target can come either
-# from a release predicate, a cached verification record, or a hand-written
-# measurement file.
 def measurement_from_payload(payload: Any) -> Any:
     from tinfoil.attestation.types import Measurement, PredicateType
 
@@ -508,14 +347,20 @@ class VerifiedTinfoilTransport(BaseTransport):
         self.client.close()
 
 
-# This is the only proxy-aware layer. It handles the public config + challenge
-# handshake, then sends the real application request with auth headers attached.
-class OwnerAuthProxyClient:
-    def __init__(self, *, transport: BaseTransport, state: OwnerState) -> None:
+@dataclass(slots=True)
+class StorageSummary:
+    browser_vault_db: str
+    browser_vault_store: str
+    legacy_python_state_path: str
+    legacy_python_state_present: bool
+    python_client_secret_state: str
+    server_side_passkey_store: str
+
+
+class GatewayPublicClient:
+    def __init__(self, *, transport: BaseTransport) -> None:
         self.transport = transport
-        self.state = state
         self.public_config: dict[str, Any] | None = None
-        self._upstream_bootstrapped = False
 
     def load_public_config(self) -> dict[str, Any]:
         response = self.transport.request("GET", "/api/public/config")
@@ -524,131 +369,31 @@ class OwnerAuthProxyClient:
         self.public_config = config
         return config
 
-    def ensure_owner_key_matches(self) -> None:
-        config = self.public_config or self.load_public_config()
-        if not config.get("owner_key_configured"):
-            raise RuntimeError("server does not have OWNER_PUBLIC_KEY_JWK configured")
-        if config.get("owner_key_id") != self.state.owner_key_id:
-            raise RuntimeError(
-                "local owner key does not match server owner key\n"
-                f"local={self.state.owner_key_id}\n"
-                f"server={config.get('owner_key_id')}"
-            )
-
-    def authenticated_request(
-        self,
-        method: str,
-        path: str,
-        *,
-        json_body: dict[str, Any] | None = None,
-        raw_body: bytes | None = None,
-        extra_headers: dict[str, str] | None = None,
-    ) -> httpx.Response:
-        if json_body is not None and raw_body is not None:
-            raise ValueError("provide either json_body or raw_body, not both")
-        if path not in {"/api/private/bootstrap", "/api/private/session/login"}:
-            self.bootstrap_upstream()
-
-        body = raw_body
-        if json_body is not None:
-            body = json.dumps(json_body, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
-        if body is None:
-            body = b""
-
-        # Ask the proxy for a one-time challenge tied to the exact request we
-        # are about to send.
-        challenge_body = {
-            "method": method.upper(),
-            "path": path,
-            "body_sha256": sha256_hex(body),
-        }
-        challenge_response = self.transport.request(
-            "POST",
-            "/api/public/challenge",
-            headers={"content-type": "application/json"},
-            content=json.dumps(challenge_body, separators=(",", ":"), ensure_ascii=True).encode("utf-8"),
-        )
-        challenge_response.raise_for_status()
-        challenge = challenge_response.json()
-
-        # Recompute the expected payload locally before signing it. This keeps
-        # the client in control of what it is actually authorizing.
-        expected_payload = build_signing_payload(
-            challenge_id=challenge["challenge_id"],
-            nonce=challenge["nonce"],
-            method=method.upper(),
-            path=path,
-            body_sha256=challenge_body["body_sha256"],
-            expires_at=challenge["expires_at"],
-        )
-        if challenge["signing_payload"] != expected_payload:
-            raise RuntimeError("server returned an unexpected signing payload")
-
-        headers = {
-            "x-auth-challenge-id": challenge["challenge_id"],
-            "x-auth-key-id": self.state.owner_key_id,
-            "x-auth-signature": sign_payload(self.state.owner_private_jwk, challenge["signing_payload"]),
-        }
-        if body:
-            headers["content-type"] = "application/json"
-        if extra_headers:
-            headers.update(extra_headers)
-
-        return self.transport.request(
-            method,
-            path,
-            headers=headers,
-            content=body or None,
-        )
-
-    def bootstrap_upstream(self) -> dict[str, Any]:
-        if self._upstream_bootstrapped:
-            return {"bootstrapped": True, "env_keys": sorted((self.state.bootstrap_env or {}).keys())}
-        response = self.authenticated_request(
-            "POST",
-            "/api/private/bootstrap",
-            json_body={"env": self.state.bootstrap_env or {}},
-        )
-        response.raise_for_status()
-        self._upstream_bootstrapped = True
-        return response.json()
-
-    def get_json(self, path: str) -> dict[str, Any]:
-        response = self.authenticated_request("GET", path)
-        response.raise_for_status()
-        return response.json()
-
-    def post_json(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        response = self.authenticated_request("POST", path, json_body=payload)
-        response.raise_for_status()
-        return response.json()
-
-    def login_session(self) -> dict[str, Any]:
-        response = self.authenticated_request(
-            "POST",
-            "/api/private/session/login",
-            json_body={"bootstrap_env": self.state.bootstrap_env or {}},
-        )
-        response.raise_for_status()
-        self._upstream_bootstrapped = True
-        return response.json()
+    def unlock_url(self) -> str:
+        base_url = getattr(self.transport, "base_url", "").rstrip("/")
+        if not base_url:
+            raise RuntimeError("transport does not expose a remote base URL")
+        return f"{base_url}/"
 
 
-# The CLI stays thin on purpose: load state, choose transport, then delegate to
-# the shared client so local and verified modes behave the same way.
-def print_state_summary(state: OwnerState, state_path: Path) -> None:
-    print(f"state_path={state_path}")
-    print(f"owner_key_id={state.owner_key_id}")
-    bootstrap_keys = sorted((state.bootstrap_env or {}).keys())
-    print("bootstrap_env_keys=" + ",".join(bootstrap_keys or ["none"]))
-    print("OWNER_PUBLIC_KEY_JWK=" + json.dumps(state.owner_public_jwk, separators=(",", ":")))
+def local_storage_summary(legacy_state_path: Path) -> StorageSummary:
+    return StorageSummary(
+        browser_vault_db="openclaw.auth-proxy.keystore.v2",
+        browser_vault_store="vault",
+        legacy_python_state_path=str(legacy_state_path),
+        legacy_python_state_present=legacy_state_path.exists(),
+        python_client_secret_state="none",
+        server_side_passkey_store="PASSKEY_STORE_PATH",
+    )
 
 
-def resolve_bootstrap_env(args: argparse.Namespace) -> dict[str, str]:
-    value = (args.anthropic_api_key or os.getenv("ANTHROPIC_API_KEY") or "").strip()
-    if not value:
-        return {}
-    return {"ANTHROPIC_API_KEY": value}
+def print_storage_summary(summary: StorageSummary) -> None:
+    print("browser_vault_db=" + summary.browser_vault_db)
+    print("browser_vault_store=" + summary.browser_vault_store)
+    print("legacy_python_state_path=" + summary.legacy_python_state_path)
+    print("legacy_python_state_present=" + ("yes" if summary.legacy_python_state_present else "no"))
+    print("python_client_secret_state=" + summary.python_client_secret_state)
+    print("server_side_passkey_store=" + summary.server_side_passkey_store)
 
 
 def jsonable(value: Any) -> Any:
@@ -698,29 +443,26 @@ def build_transport(args: argparse.Namespace) -> BaseTransport:
 
 
 def cmd_bootstrap(args: argparse.Namespace) -> int:
-    state_path = Path(args.state_file).expanduser()
-    store = StateStore(state_path)
-
-    if store.exists() and not args.force:
-        state = store.load()
-        print_state_summary(state, state_path)
-        return 0
-
-    state = store.create(force=args.force, bootstrap_env=resolve_bootstrap_env(args))
-    print_state_summary(state, state_path)
+    legacy_state_path = Path(args.state_file).expanduser()
+    summary = local_storage_summary(legacy_state_path)
+    if args.purge_legacy_state and legacy_state_path.exists():
+        legacy_state_path.unlink()
+        summary = local_storage_summary(legacy_state_path)
+        print("purged_legacy_state=yes")
+    else:
+        print("purged_legacy_state=no")
+    print_storage_summary(summary)
     return 0
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
-    state_path = Path(args.state_file).expanduser()
-    state = StateStore(state_path).load()
     transport: BaseTransport | None = None
     try:
         transport = build_transport(args)
-        client = OwnerAuthProxyClient(transport=transport, state=state)
+        client = GatewayPublicClient(transport=transport)
         config = client.load_public_config()
-        client.ensure_owner_key_matches()
         print(f"transport={transport.describe()}")
+        print("unlock_url=" + client.unlock_url())
         print("public_config=" + json.dumps(config, indent=2))
         print(render_verification_document(transport.get_verification_document()))
         return 0
@@ -731,102 +473,26 @@ def cmd_verify(args: argparse.Namespace) -> int:
             transport.close()
 
 
-def cmd_request(args: argparse.Namespace) -> int:
-    state_path = Path(args.state_file).expanduser()
-    state = StateStore(state_path).load()
-    transport: BaseTransport | None = None
-    try:
-        transport = build_transport(args)
-        client = OwnerAuthProxyClient(transport=transport, state=state)
-        client.ensure_owner_key_matches()
-        payload = None
-        if args.json is not None:
-            payload = json.loads(args.json)
-
-        response = client.authenticated_request(args.method.upper(), args.path, json_body=payload)
-        print(f"status={response.status_code}")
-        content_type = response.headers.get("content-type", "")
-        if "application/json" in content_type:
-            print(json.dumps(response.json(), indent=2))
-        else:
-            print(response.text)
-        return 0
-    except Exception as exc:
-        return report_command_error(exc)
-    finally:
-        if transport is not None:
-            transport.close()
-
-
-def cmd_chat(args: argparse.Namespace) -> int:
-    state_path = Path(args.state_file).expanduser()
-    state = StateStore(state_path).load()
-    transport: BaseTransport | None = None
-    try:
-        transport = build_transport(args)
-        client = OwnerAuthProxyClient(transport=transport, state=state)
-        client.load_public_config()
-        client.ensure_owner_key_matches()
-
-        print(f"transport={transport.describe()}")
-        if args.mode == "tinfoil":
-            print(render_verification_document(transport.get_verification_document()))
-        # Keep the interactive mode generic: it is just a small shell over the
-        # same authenticated request primitive used by the one-shot command.
-        print("type /quit to exit, /verify to print verification info, /request METHOD /path [json] to send a request")
-
-        while True:
-            line = input("> ").strip()
-            if not line:
-                continue
-            if line in {"/quit", "/exit"}:
-                return 0
-            if line == "/verify":
-                print(render_verification_document(transport.get_verification_document()))
-                continue
-            if line.startswith("/request "):
-                parts = line.split(" ", 3)
-                if len(parts) < 3:
-                    eprint("usage: /request METHOD /path [json]")
-                    continue
-                method = parts[1]
-                path = parts[2]
-                payload = None
-                if len(parts) == 4:
-                    payload = json.loads(parts[3])
-                response = client.authenticated_request(method, path, json_body=payload)
-                print(f"status={response.status_code}")
-                content_type = response.headers.get("content-type", "")
-                if "application/json" in content_type:
-                    print(json.dumps(response.json(), indent=2))
-                else:
-                    print(response.text)
-                continue
-
-            eprint("use /request METHOD /path [json]")
-    except Exception as exc:
-        return report_command_error(exc)
-    finally:
-        if transport is not None:
-            transport.close()
+def cmd_removed_direct_mode(args: argparse.Namespace) -> int:
+    del args
+    eprint(
+        "error: direct authenticated request/chat mode was removed. "
+        "Passkey authentication now happens in the browser on the enclave origin. "
+        "Use `serve` to verify and launch the remote unlock page, then continue in the browser."
+    )
+    return 2
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
-    state_path = Path(args.state_file).expanduser()
-    state = StateStore(state_path).load()
     transport: BaseTransport | None = None
     try:
         transport = build_transport(args)
-        owner_client = OwnerAuthProxyClient(transport=transport, state=state)
+        gateway_client = GatewayPublicClient(transport=transport)
 
-        # The browser never touches the owner key directly in this mode. Python
-        # verifies the remote target and mints the upstream session first.
         try:
-            from python_client import local_browser_proxy as browser_proxy_module
-            from python_client.local_browser_proxy import AuthenticatedRemoteSession, create_browser_gateway_app
+            from python_client.local_browser_proxy import VerifiedLaunchSession, create_browser_gateway_app
         except ModuleNotFoundError:
-            import local_browser_proxy as browser_proxy_module
-            from local_browser_proxy import AuthenticatedRemoteSession, create_browser_gateway_app
+            from local_browser_proxy import VerifiedLaunchSession, create_browser_gateway_app
 
         try:
             import uvicorn
@@ -834,25 +500,21 @@ def cmd_serve(args: argparse.Namespace) -> int:
             raise TransportError(
                 "uvicorn is not installed. Install python_client/requirements.txt to use serve mode."
             ) from exc
-        if browser_proxy_module.websockets.connect is None:
-            raise TransportError(
-                "websockets is not installed. Install python_client/requirements.txt to use serve mode."
-            )
 
-        remote_session = AuthenticatedRemoteSession(transport=transport, owner_client=owner_client)
-        status_payload = remote_session.bootstrap()
+        launch_session = VerifiedLaunchSession(transport=transport, gateway_client=gateway_client)
+        status_payload = launch_session.bootstrap()
         print(f"transport={status_payload.transport}")
         print("public_config=" + json.dumps(status_payload.public_config, indent=2))
+        print("unlock_url=" + status_payload.unlock_url)
         if args.mode == "tinfoil":
             print(render_verification_document(status_payload.verification_document))
         local_url = f"http://{args.host}:{args.port}"
-        print(f"local_browser_gateway={local_url}")
-        print(f"workspace_url={local_url}{status_payload.workspace_path}")
+        print(f"local_verification_center={local_url}")
         if args.open_browser:
             import webbrowser
 
             webbrowser.open(local_url)
-        app = create_browser_gateway_app(remote_session)
+        app = create_browser_gateway_app(launch_session)
         uvicorn.run(app, host=args.host, port=args.port, reload=False, log_level=args.log_level)
         return 0
     except Exception as exc:
@@ -863,37 +525,41 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Local owner-auth client for the OpenClaw auth proxy.",
+        description="Passkey-aware verifier and launcher for the OpenClaw auth proxy.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    bootstrap = subparsers.add_parser("bootstrap", help="generate or print the local owner key state")
-    bootstrap.add_argument("--state-file", default=str(DEFAULT_STATE_PATH))
-    bootstrap.add_argument("--force", action="store_true")
-    bootstrap.add_argument("--anthropic-api-key", default="")
+    bootstrap = subparsers.add_parser(
+        "bootstrap",
+        help="show current secret-storage locations and optionally delete the old owner-key state file",
+    )
+    bootstrap.add_argument("--state-file", default=str(LEGACY_STATE_PATH))
+    bootstrap.add_argument("--purge-legacy-state", action="store_true")
     bootstrap.set_defaults(func=cmd_bootstrap)
 
-    for name, help_text, handler in [
-        ("verify", "verify server config and print attestation details when available", cmd_verify),
-        ("request", "make one authenticated request through the proxy", cmd_request),
-        ("chat", "run a simple interactive authenticated request shell", cmd_chat),
+    verify = subparsers.add_parser(
+        "verify",
+        help="fetch public config and print attestation details when available",
+    )
+    verify.add_argument("--mode", choices=("local", "tinfoil"), default="local")
+    verify.add_argument("--base-url", default="http://127.0.0.1:8080")
+    verify.add_argument("--enclave", default="")
+    verify.add_argument("--repo", default="")
+    verify.add_argument("--release-tag", default="")
+    verify.add_argument("--measurement-file", default="")
+    verify.set_defaults(func=cmd_verify)
+
+    for name, help_text in [
+        ("request", "removed: direct authenticated requests are no longer available"),
+        ("chat", "removed: interactive direct requests are no longer available"),
     ]:
         sub = subparsers.add_parser(name, help=help_text)
-        sub.add_argument("--state-file", default=str(DEFAULT_STATE_PATH))
-        sub.add_argument("--mode", choices=("local", "tinfoil"), default="local")
-        sub.add_argument("--base-url", default="http://127.0.0.1:8080")
-        sub.add_argument("--enclave", default="")
-        sub.add_argument("--repo", default="")
-        sub.add_argument("--release-tag", default="")
-        sub.add_argument("--measurement-file", default="")
-        if name == "request":
-            sub.add_argument("method")
-            sub.add_argument("path")
-            sub.add_argument("--json")
-        sub.set_defaults(func=handler)
+        sub.set_defaults(func=cmd_removed_direct_mode)
 
-    serve = subparsers.add_parser("serve", help="run a localhost browser gateway that proxies the real OpenClaw UI")
-    serve.add_argument("--state-file", default=str(DEFAULT_STATE_PATH))
+    serve = subparsers.add_parser(
+        "serve",
+        help="run a localhost verification center that launches the real remote passkey flow",
+    )
     serve.add_argument("--mode", choices=("local", "tinfoil"), default="local")
     serve.add_argument("--base-url", default="http://127.0.0.1:8080")
     serve.add_argument("--enclave", default="")

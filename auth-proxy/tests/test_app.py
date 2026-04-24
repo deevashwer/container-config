@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
+import secrets
 import sys
-from dataclasses import dataclass
+import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
 import pytest
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
@@ -20,12 +22,14 @@ if str(APP_ROOT) not in sys.path:
 
 import app.main as main_module
 from app.main import WEBSOCKET_CLOSE_UNAUTHORIZED, create_app
-from app.security import (
-    base64url_encode,
-    key_id_from_public_jwk,
-    public_jwk_from_key,
-)
+from app.passkeys import base64url_encode
 from app.settings import build_settings
+
+
+TEST_ORIGIN = "http://testserver"
+FLAG_USER_PRESENT = 0x01
+FLAG_USER_VERIFIED = 0x04
+FLAG_ATTESTED_CREDENTIAL_DATA = 0x40
 
 
 class DummyAsyncClient:
@@ -136,65 +140,217 @@ class DummyWebSocketsModule:
         return cls.last_connection
 
 
+def cbor_encode_length(major_type: int, value: int) -> bytes:
+    if value < 24:
+        return bytes([(major_type << 5) | value])
+    if value < 256:
+        return bytes([(major_type << 5) | 24, value])
+    if value < 65536:
+        return bytes([(major_type << 5) | 25]) + value.to_bytes(2, "big")
+    return bytes([(major_type << 5) | 26]) + value.to_bytes(4, "big")
+
+
+def cbor_encode(value) -> bytes:
+    if isinstance(value, bool):
+        return b"\xf5" if value else b"\xf4"
+    if value is None:
+        return b"\xf6"
+    if isinstance(value, int):
+        if value >= 0:
+            return cbor_encode_length(0, value)
+        return cbor_encode_length(1, -1 - value)
+    if isinstance(value, bytes):
+        return cbor_encode_length(2, len(value)) + value
+    if isinstance(value, str):
+        encoded = value.encode("utf-8")
+        return cbor_encode_length(3, len(encoded)) + encoded
+    if isinstance(value, list):
+        return cbor_encode_length(4, len(value)) + b"".join(cbor_encode(item) for item in value)
+    if isinstance(value, dict):
+        chunks = []
+        for key, item in value.items():
+            chunks.append(cbor_encode(key))
+            chunks.append(cbor_encode(item))
+        return cbor_encode_length(5, len(value)) + b"".join(chunks)
+    raise TypeError(f"unsupported CBOR type: {type(value)!r}")
+
+
+@dataclass
+class VirtualPasskey:
+    private_key: ec.EllipticCurvePrivateKey = field(default_factory=lambda: ec.generate_private_key(ec.SECP256R1()))
+    credential_id_bytes: bytes = field(default_factory=lambda: secrets.token_bytes(32))
+    sign_count: int = 0
+
+    @property
+    def credential_id(self) -> str:
+        return base64url_encode(self.credential_id_bytes)
+
+    def _client_data(self, *, ceremony_type: str, challenge: str, origin: str) -> bytes:
+        return json.dumps(
+            {
+                "type": ceremony_type,
+                "challenge": challenge,
+                "origin": origin,
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+    def _cose_public_key(self) -> dict[int, object]:
+        numbers = self.private_key.public_key().public_numbers()
+        return {
+            1: 2,
+            3: -7,
+            -1: 1,
+            -2: numbers.x.to_bytes(32, "big"),
+            -3: numbers.y.to_bytes(32, "big"),
+        }
+
+    def _registration_authenticator_data(self, rp_id: str) -> bytes:
+        rp_hash = hashlib.sha256(rp_id.encode("utf-8")).digest()
+        flags = FLAG_USER_PRESENT | FLAG_USER_VERIFIED | FLAG_ATTESTED_CREDENTIAL_DATA
+        return (
+            rp_hash
+            + bytes([flags])
+            + self.sign_count.to_bytes(4, "big")
+            + (b"\x00" * 16)
+            + len(self.credential_id_bytes).to_bytes(2, "big")
+            + self.credential_id_bytes
+            + cbor_encode(self._cose_public_key())
+        )
+
+    def _assertion_authenticator_data(self, rp_id: str) -> bytes:
+        self.sign_count += 1
+        rp_hash = hashlib.sha256(rp_id.encode("utf-8")).digest()
+        flags = FLAG_USER_PRESENT | FLAG_USER_VERIFIED
+        return rp_hash + bytes([flags]) + self.sign_count.to_bytes(4, "big")
+
+    def build_registration_request(
+        self,
+        options: dict[str, object],
+        *,
+        origin: str = TEST_ORIGIN,
+        bootstrap_env: dict[str, str] | None = None,
+    ) -> dict[str, object]:
+        public_key = options["public_key"]
+        client_data = self._client_data(
+            ceremony_type="webauthn.create",
+            challenge=public_key["challenge"],
+            origin=origin,
+        )
+        attestation_object = cbor_encode(
+            {
+                "fmt": "none",
+                "attStmt": {},
+                "authData": self._registration_authenticator_data(public_key["rp"]["id"]),
+            }
+        )
+        return {
+            "challenge_id": options["challenge_id"],
+            "credential": {
+                "id": self.credential_id,
+                "rawId": self.credential_id,
+                "type": "public-key",
+                "response": {
+                    "clientDataJSON": base64url_encode(client_data),
+                    "attestationObject": base64url_encode(attestation_object),
+                },
+            },
+            "bootstrap_env": bootstrap_env or {},
+        }
+
+    def build_authentication_request(
+        self,
+        options: dict[str, object],
+        *,
+        origin: str = TEST_ORIGIN,
+        bootstrap_env: dict[str, str] | None = None,
+    ) -> dict[str, object]:
+        public_key = options["public_key"]
+        client_data = self._client_data(
+            ceremony_type="webauthn.get",
+            challenge=public_key["challenge"],
+            origin=origin,
+        )
+        authenticator_data = self._assertion_authenticator_data(public_key["rpId"])
+        signature = self.private_key.sign(
+            authenticator_data + hashlib.sha256(client_data).digest(),
+            ec.ECDSA(hashes.SHA256()),
+        )
+        return {
+            "challenge_id": options["challenge_id"],
+            "credential": {
+                "id": self.credential_id,
+                "rawId": self.credential_id,
+                "type": "public-key",
+                "response": {
+                    "clientDataJSON": base64url_encode(client_data),
+                    "authenticatorData": base64url_encode(authenticator_data),
+                    "signature": base64url_encode(signature),
+                    "userHandle": None,
+                },
+            },
+            "bootstrap_env": bootstrap_env or {},
+        }
+
+
 def make_client(
     *,
     public_patterns: tuple[str, ...] = ("/", "/assets/*", "/favicon.svg", "/healthz", "/api/public/*"),
     aux_application_base_url: str | None = None,
     aux_application_path_prefix: str = "/aux-application",
-) -> tuple[TestClient, ec.EllipticCurvePrivateKey]:
-    private_key = ec.generate_private_key(ec.SECP256R1())
-    public_jwk = public_jwk_from_key(private_key.public_key())
+    openclaw_bootstrap_base_url: str | None = None,
+) -> TestClient:
+    passkey_store_path = str(Path(tempfile.mkdtemp()) / "passkeys.json")
     settings = build_settings(
-        owner_public_key_jwk=public_jwk,
         upstream_base_url="http://example-upstream",
         aux_application_base_url=aux_application_base_url,
         aux_application_path_prefix=aux_application_path_prefix,
+        openclaw_bootstrap_base_url=openclaw_bootstrap_base_url,
         challenge_ttl_seconds=60,
         session_ttl_seconds=300,
         session_cookie_name="proxy-session",
         public_path_patterns=public_patterns,
+        passkey_store_path=passkey_store_path,
     )
-    return TestClient(create_app(settings)), private_key
+    return TestClient(create_app(settings))
 
 
-def sign_payload(private_key: ec.EllipticCurvePrivateKey, payload: str) -> str:
-    signature = private_key.sign(payload.encode("utf-8"), ec.ECDSA(hashes.SHA256()))
-    return base64url_encode(signature)
+def begin_initialization(client: TestClient) -> dict[str, object]:
+    response = client.post("/api/public/init/options", headers={"origin": TEST_ORIGIN})
+    assert response.status_code == 200
+    return response.json()
 
 
-def sign_payload_raw_p1363(private_key: ec.EllipticCurvePrivateKey, payload: str) -> str:
-    der_signature = private_key.sign(payload.encode("utf-8"), ec.ECDSA(hashes.SHA256()))
-    r, s = decode_dss_signature(der_signature)
-    raw_signature = r.to_bytes(32, "big") + s.to_bytes(32, "big")
-    return base64url_encode(raw_signature)
-
-
-def auth_headers(
+def initialize_enclave(
     client: TestClient,
-    private_key: ec.EllipticCurvePrivateKey,
+    passkey: VirtualPasskey,
     *,
-    method: str,
-    path: str,
-    body: str = "",
-    key_id: str | None = None,
-    signing_key: ec.EllipticCurvePrivateKey | None = None,
-) -> dict[str, str]:
-    public_jwk = public_jwk_from_key(private_key.public_key())
-    challenge = client.post(
-        "/api/public/challenge",
-        json={
-            "method": method,
-            "path": path,
-            "body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
-        },
+    bootstrap_env: dict[str, str] | None = None,
+) -> httpx.Response:
+    options = begin_initialization(client)
+    return client.post(
+        "/api/public/init/finish",
+        json=passkey.build_registration_request(options, bootstrap_env=bootstrap_env),
     )
-    assert challenge.status_code == 200
-    payload = challenge.json()
-    return {
-        "x-auth-challenge-id": payload["challenge_id"],
-        "x-auth-key-id": key_id or key_id_from_public_jwk(public_jwk),
-        "x-auth-signature": sign_payload(signing_key or private_key, payload["signing_payload"]),
-    }
+
+
+def begin_authentication(client: TestClient) -> dict[str, object]:
+    response = client.post("/api/public/passkeys/authenticate/options", headers={"origin": TEST_ORIGIN})
+    assert response.status_code == 200
+    return response.json()
+
+
+def authenticate_passkey(
+    client: TestClient,
+    passkey: VirtualPasskey,
+    *,
+    bootstrap_env: dict[str, str] | None = None,
+) -> httpx.Response:
+    options = begin_authentication(client)
+    return client.post(
+        "/api/public/passkeys/authenticate/finish",
+        json=passkey.build_authentication_request(options, bootstrap_env=bootstrap_env),
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -207,19 +363,18 @@ def patch_network_clients(monkeypatch) -> None:
 
 
 def test_public_config_is_accessible_without_auth() -> None:
-    client, private_key = make_client()
-    del private_key
+    client = make_client()
 
     response = client.get("/api/public/config")
 
     assert response.status_code == 200
     assert response.json()["session_cookie_name"] == "proxy-session"
-    assert response.json()["owner_key_configured"] is True
+    assert response.json()["ownership_claimed"] is False
+    assert response.json()["initialization_available"] is True
 
 
 def test_root_dashboard_is_public() -> None:
-    client, private_key = make_client()
-    del private_key
+    client = make_client()
 
     response = client.get("/")
 
@@ -228,18 +383,16 @@ def test_root_dashboard_is_public() -> None:
 
 
 def test_static_assets_are_public() -> None:
-    client, private_key = make_client()
-    del private_key
+    client = make_client()
 
     response = client.get("/assets/app.js")
 
     assert response.status_code == 200
-    assert "OwnerAuthBrowserClient" in response.text
+    assert "PasskeyAuthBrowserClient" in response.text
 
 
 def test_favicon_is_public() -> None:
-    client, private_key = make_client()
-    del private_key
+    client = make_client()
 
     response = client.get("/favicon.svg")
 
@@ -247,232 +400,90 @@ def test_favicon_is_public() -> None:
     assert "<svg" in response.text
 
 
-def test_proxy_forwards_authenticated_request() -> None:
-    client, private_key = make_client()
-    headers = auth_headers(
-        client,
-        private_key,
-        method="GET",
-        path="/openclaw/__openclaw/control-ui-config.json",
-    )
-    headers["origin"] = "http://127.0.0.1:8080"
-
-    response = client.get("/openclaw/__openclaw/control-ui-config.json", headers=headers)
-
-    assert response.status_code == 200
-    assert response.json()["forwarded"] is True
-    assert DummyAsyncClient.last_request is not None
-    assert DummyAsyncClient.last_request["url"] == "http://example-upstream/openclaw/__openclaw/control-ui-config.json"
-    assert "x-auth-signature" not in DummyAsyncClient.last_request["headers"]
-    assert DummyAsyncClient.last_request["headers"]["Origin"] == "http://127.0.0.1:8080"
-    assert DummyAsyncClient.last_request["headers"]["X-Forwarded-Proto"] == "http"
-    assert DummyAsyncClient.last_request["headers"]["X-Forwarded-Host"] == "testserver"
-
-
-def test_proxy_accepts_browser_style_raw_signature() -> None:
-    client, private_key = make_client()
-    public_jwk = public_jwk_from_key(private_key.public_key())
-    challenge = client.post(
-        "/api/public/challenge",
-        json={
-            "method": "GET",
-            "path": "/openclaw/__openclaw/control-ui-config.json",
-            "body_sha256": hashlib.sha256(b"").hexdigest(),
-        },
-    )
-    assert challenge.status_code == 200
-    payload = challenge.json()
-
-    response = client.get(
-        "/openclaw/__openclaw/control-ui-config.json",
-        headers={
-            "x-auth-challenge-id": payload["challenge_id"],
-            "x-auth-key-id": key_id_from_public_jwk(public_jwk),
-            "x-auth-signature": sign_payload_raw_p1363(private_key, payload["signing_payload"]),
-        },
-    )
-
-    assert response.status_code == 200
-    assert response.json()["forwarded"] is True
-
-
-def test_proxy_rejects_missing_headers() -> None:
-    client, private_key = make_client()
-    del private_key
+def test_proxy_rejects_missing_session_cookie() -> None:
+    client = make_client()
 
     response = client.get("/openclaw")
 
     assert response.status_code == 401
-    assert response.json()["detail"] == "missing auth headers"
+    assert response.json()["detail"] == "missing session cookie"
 
 
-def test_proxy_rejects_replayed_challenge() -> None:
-    client, private_key = make_client()
-    headers = auth_headers(client, private_key, method="GET", path="/openclaw")
+def test_enclave_initialization_creates_cookie_and_allows_followup_requests() -> None:
+    client = make_client()
+    passkey = VirtualPasskey()
 
-    first = client.get("/openclaw", headers=headers)
-    second = client.get("/openclaw", headers=headers)
+    registration = initialize_enclave(client, passkey)
+    follow_up = client.get("/openclaw")
+
+    assert registration.status_code == 200
+    assert registration.json()["authenticated"] is True
+    assert registration.json()["credential_id"] == passkey.credential_id
+    assert "proxy-session" in client.cookies
+    assert follow_up.status_code == 200
+    assert DummyAsyncClient.last_request is not None
+    assert DummyAsyncClient.last_request["url"] == "http://example-upstream/openclaw"
+    assert "cookie" not in {key.lower() for key in DummyAsyncClient.last_request["headers"]}
+
+
+def test_enclave_initialization_is_gone_after_first_claim() -> None:
+    client = make_client()
+    passkey = VirtualPasskey()
+
+    first = initialize_enclave(client, passkey)
+    second = client.post("/api/public/init/options", headers={"origin": TEST_ORIGIN})
 
     assert first.status_code == 200
-    assert second.status_code == 401
-    assert second.json()["detail"] == "challenge already used"
+    assert second.status_code == 410
+    assert second.json()["detail"] == "this enclave has already been initialized"
 
 
-def test_proxy_rejects_path_mismatch() -> None:
-    client, private_key = make_client()
-    headers = auth_headers(client, private_key, method="GET", path="/openclaw")
+def test_passkey_authentication_recreates_session_after_logout() -> None:
+    client = make_client()
+    passkey = VirtualPasskey()
+    initialize_enclave(client, passkey)
+    client.post("/api/private/session/logout")
 
-    response = client.get("/different-path", headers=headers)
-
-    assert response.status_code == 401
-    assert response.json()["detail"] == "challenge path mismatch"
-
-
-def test_proxy_rejects_method_mismatch() -> None:
-    client, private_key = make_client()
-    headers = auth_headers(client, private_key, method="GET", path="/openclaw")
-
-    response = client.post("/openclaw", headers=headers)
-
-    assert response.status_code == 401
-    assert response.json()["detail"] == "challenge method mismatch"
-
-
-def test_proxy_rejects_body_hash_mismatch() -> None:
-    client, private_key = make_client()
-    headers = auth_headers(client, private_key, method="POST", path="/openclaw", body="")
-
-    response = client.post("/openclaw", headers=headers, content=b'{"changed":true}')
-
-    assert response.status_code == 401
-    assert response.json()["detail"] == "challenge body hash mismatch"
-
-
-def test_proxy_rejects_unknown_owner_key() -> None:
-    client, private_key = make_client()
-    other_private_key = ec.generate_private_key(ec.SECP256R1())
-    other_public_jwk = public_jwk_from_key(other_private_key.public_key())
-    headers = auth_headers(
-        client,
-        private_key,
-        method="GET",
-        path="/openclaw",
-        key_id=key_id_from_public_jwk(other_public_jwk),
-    )
-
-    response = client.get("/openclaw", headers=headers)
-
-    assert response.status_code == 401
-    assert response.json()["detail"] == "unknown owner key"
-
-
-def test_proxy_rejects_invalid_signature() -> None:
-    client, private_key = make_client()
-    wrong_private_key = ec.generate_private_key(ec.SECP256R1())
-    headers = auth_headers(
-        client,
-        private_key,
-        method="GET",
-        path="/openclaw",
-        signing_key=wrong_private_key,
-    )
-
-    response = client.get("/openclaw", headers=headers)
-
-    assert response.status_code == 401
-    assert response.json()["detail"] == "invalid signature"
-
-
-def test_session_login_creates_cookie_and_allows_followup_requests() -> None:
-    client, private_key = make_client()
-    request_body = '{"bootstrap_env":{"ANTHROPIC_API_KEY":"x"}}'
-    headers = auth_headers(
-        client,
-        private_key,
-        method="POST",
-        path="/api/private/session/login",
-        body=request_body,
-    )
-
-    login = client.post(
-        "/api/private/session/login",
-        headers={**headers, "content-type": "application/json"},
-        content=request_body,
-    )
+    login = authenticate_passkey(client, passkey)
     follow_up = client.get("/openclaw")
 
     assert login.status_code == 200
     assert login.json()["authenticated"] is True
-    assert "proxy-session" in client.cookies
     assert follow_up.status_code == 200
-    assert DummyAsyncClient.last_request is not None
-    assert "cookie" not in {key.lower() for key in DummyAsyncClient.last_request["headers"]}
 
 
-def test_session_status_supports_header_and_cookie_auth() -> None:
-    client, private_key = make_client()
-    direct_headers = auth_headers(
-        client,
-        private_key,
-        method="GET",
-        path="/api/private/session",
-    )
+def test_passkey_authentication_requires_registered_passkey() -> None:
+    client = make_client()
 
-    direct = client.get("/api/private/session", headers=direct_headers)
+    response = client.post("/api/public/passkeys/authenticate/options", headers={"origin": TEST_ORIGIN})
 
-    login_headers = auth_headers(
-        client,
-        private_key,
-        method="POST",
-        path="/api/private/session/login",
-        body='{"bootstrap_env":{"ANTHROPIC_API_KEY":"x"}}',
-    )
-    login = client.post(
-        "/api/private/session/login",
-        headers={**login_headers, "content-type": "application/json"},
-        content='{"bootstrap_env":{"ANTHROPIC_API_KEY":"x"}}',
-    )
-    via_cookie = client.get("/api/private/session")
-
-    assert direct.status_code == 200
-    assert direct.json()["auth_kind"] == "headers"
-    assert login.status_code == 200
-    assert via_cookie.status_code == 200
-    assert via_cookie.json()["auth_kind"] == "session"
-    assert via_cookie.json()["expires_at"] is not None
+    assert response.status_code == 409
+    assert response.json()["detail"] == "no passkey is registered for this gateway yet"
 
 
-def test_session_logout_clears_cookie_and_relocks_private_routes() -> None:
-    client, private_key = make_client()
-    request_body = '{"bootstrap_env":{"ANTHROPIC_API_KEY":"x"}}'
-    headers = auth_headers(
-        client,
-        private_key,
-        method="POST",
-        path="/api/private/session/login",
-        body=request_body,
-    )
-    client.post(
-        "/api/private/session/login",
-        headers={**headers, "content-type": "application/json"},
-        content=request_body,
-    )
+def test_session_status_and_logout_use_cookie_auth() -> None:
+    client = make_client()
+    passkey = VirtualPasskey()
+    initialize_enclave(client, passkey)
 
+    status_response = client.get("/api/private/session")
     logout = client.post("/api/private/session/logout")
     locked = client.get("/openclaw")
 
+    assert status_response.status_code == 200
+    assert status_response.json()["auth_kind"] == "session"
+    assert status_response.json()["credential_id"] == passkey.credential_id
     assert logout.status_code == 200
     assert logout.json()["authenticated"] is False
     assert "proxy-session" not in client.cookies
     assert locked.status_code == 401
-    assert locked.json()["detail"] == "missing auth headers"
+    assert locked.json()["detail"] == "missing session cookie"
 
 
 def test_public_routes_bypass_auth() -> None:
-    client, private_key = make_client(
+    client = make_client(
         public_patterns=("/", "/assets/*", "/favicon.svg", "/healthz", "/api/public/*", "/webhooks/*")
     )
-    del private_key
 
     response = client.post("/webhooks/telegram", json={"ok": True})
 
@@ -483,15 +494,11 @@ def test_public_routes_bypass_auth() -> None:
 
 
 def test_aux_application_prefix_routes_to_alternate_upstream() -> None:
-    client, private_key = make_client(aux_application_base_url="http://127.0.0.1:3000")
-    headers = auth_headers(
-        client,
-        private_key,
-        method="GET",
-        path="/aux-application/index.html",
-    )
+    client = make_client(aux_application_base_url="http://127.0.0.1:3000")
+    passkey = VirtualPasskey()
+    initialize_enclave(client, passkey)
 
-    response = client.get("/aux-application/index.html", headers=headers)
+    response = client.get("/aux-application/index.html")
 
     assert response.status_code == 200
     assert response.json()["forwarded"] is True
@@ -500,20 +507,9 @@ def test_aux_application_prefix_routes_to_alternate_upstream() -> None:
 
 
 def test_aux_application_websocket_routes_to_alternate_upstream() -> None:
-    client, private_key = make_client(aux_application_base_url="http://127.0.0.1:3000")
-    request_body = '{"bootstrap_env":{"ANTHROPIC_API_KEY":"x"}}'
-    headers = auth_headers(
-        client,
-        private_key,
-        method="POST",
-        path="/api/private/session/login",
-        body=request_body,
-    )
-    client.post(
-        "/api/private/session/login",
-        headers={**headers, "content-type": "application/json"},
-        content=request_body,
-    )
+    client = make_client(aux_application_base_url="http://127.0.0.1:3000")
+    passkey = VirtualPasskey()
+    initialize_enclave(client, passkey)
 
     with client.websocket_connect("/aux-application/ws") as websocket:
         websocket.send_text("hello")
@@ -524,8 +520,7 @@ def test_aux_application_websocket_routes_to_alternate_upstream() -> None:
 
 
 def test_protected_websocket_rejects_missing_session() -> None:
-    client, private_key = make_client()
-    del private_key
+    client = make_client()
 
     with pytest.raises(WebSocketDisconnect) as excinfo:
         with client.websocket_connect("/openclaw/ws"):
@@ -534,21 +529,10 @@ def test_protected_websocket_rejects_missing_session() -> None:
     assert excinfo.value.code == WEBSOCKET_CLOSE_UNAUTHORIZED
 
 
-def test_protected_websocket_forwards_after_session_login() -> None:
-    client, private_key = make_client()
-    request_body = '{"bootstrap_env":{"ANTHROPIC_API_KEY":"x"}}'
-    headers = auth_headers(
-        client,
-        private_key,
-        method="POST",
-        path="/api/private/session/login",
-        body=request_body,
-    )
-    client.post(
-        "/api/private/session/login",
-        headers={**headers, "content-type": "application/json"},
-        content=request_body,
-    )
+def test_protected_websocket_forwards_after_passkey_login() -> None:
+    client = make_client()
+    passkey = VirtualPasskey()
+    initialize_enclave(client, passkey)
 
     with client.websocket_connect(
         "/openclaw/ws",
@@ -569,32 +553,11 @@ def test_protected_websocket_forwards_after_session_login() -> None:
     assert DummyWebSocketsModule.last_connection.additional_headers["X-Forwarded-Host"] == "testserver"
 
 
-def test_session_login_bootstraps_upstream_with_fixed_anthropic_key() -> None:
-    private_key = ec.generate_private_key(ec.SECP256R1())
-    public_jwk = public_jwk_from_key(private_key.public_key())
-    settings = build_settings(
-        owner_public_key_jwk=public_jwk,
-        upstream_base_url="http://example-upstream",
-        openclaw_bootstrap_base_url="http://bootstrap",
-        challenge_ttl_seconds=60,
-        session_ttl_seconds=300,
-        session_cookie_name="proxy-session",
-    )
-    client = TestClient(create_app(settings))
-    request_body = '{"bootstrap_env":{"ANTHROPIC_API_KEY":"test-anthropic-key"}}'
-    headers = auth_headers(
-        client,
-        private_key,
-        method="POST",
-        path="/api/private/session/login",
-        body=request_body,
-    )
+def test_enclave_initialization_bootstraps_upstream_with_fixed_anthropic_key() -> None:
+    client = make_client(openclaw_bootstrap_base_url="http://bootstrap")
+    passkey = VirtualPasskey()
 
-    response = client.post(
-        "/api/private/session/login",
-        headers={**headers, "content-type": "application/json"},
-        content=request_body,
-    )
+    response = initialize_enclave(client, passkey, bootstrap_env={"ANTHROPIC_API_KEY": "test-anthropic-key"})
 
     assert response.status_code == 200
     assert len(DummyAsyncClient.requests) == 1
@@ -602,71 +565,39 @@ def test_session_login_bootstraps_upstream_with_fixed_anthropic_key() -> None:
     assert DummyAsyncClient.requests[0]["content"] == b'{"env":{"ANTHROPIC_API_KEY":"test-anthropic-key"}}'
 
 
-def test_authenticated_proxy_request_requires_bootstrap_first() -> None:
-    private_key = ec.generate_private_key(ec.SECP256R1())
-    public_jwk = public_jwk_from_key(private_key.public_key())
-    settings = build_settings(
-        owner_public_key_jwk=public_jwk,
-        upstream_base_url="http://example-upstream",
-        openclaw_bootstrap_base_url="http://bootstrap",
-        challenge_ttl_seconds=60,
-        session_ttl_seconds=300,
-        session_cookie_name="proxy-session",
-    )
-    client = TestClient(create_app(settings))
-    headers = auth_headers(
-        client,
-        private_key,
-        method="GET",
-        path="/openclaw/__openclaw/control-ui-config.json",
-    )
+def test_initialization_requires_bootstrap_env_and_does_not_partially_claim_enclave() -> None:
+    client = make_client(openclaw_bootstrap_base_url="http://bootstrap")
+    passkey = VirtualPasskey()
 
-    response = client.get("/openclaw/__openclaw/control-ui-config.json", headers=headers)
+    first = initialize_enclave(client, passkey)
+    config = client.get("/api/public/config")
+    login_options = client.post("/api/public/passkeys/authenticate/options", headers={"origin": TEST_ORIGIN})
+    second = initialize_enclave(client, passkey, bootstrap_env={"ANTHROPIC_API_KEY": "x"})
+    third = client.post("/api/public/init/options", headers={"origin": TEST_ORIGIN})
 
-    assert response.status_code == 409
-    assert response.json()["detail"] == "upstream bootstrap has not completed; initialize the session first"
+    assert first.status_code == 409
+    assert first.json()["detail"] == "upstream bootstrap env is required before OpenClaw can start"
+    assert config.status_code == 200
+    assert config.json()["ownership_claimed"] is False
+    assert config.json()["initialization_available"] is True
+    assert login_options.status_code == 409
+    assert login_options.json()["detail"] == "no passkey is registered for this gateway yet"
+    assert second.status_code == 200
+    assert third.status_code == 410
+    assert third.json()["detail"] == "this enclave has already been initialized"
+    assert DummyAsyncClient.requests[0]["url"] == "http://bootstrap/api/bootstrap/config"
+    assert DummyAsyncClient.requests[0]["content"] == b'{"env":{"ANTHROPIC_API_KEY":"x"}}'
 
 
-def test_private_bootstrap_endpoint_accepts_signed_client_env() -> None:
-    private_key = ec.generate_private_key(ec.SECP256R1())
-    public_jwk = public_jwk_from_key(private_key.public_key())
-    settings = build_settings(
-        owner_public_key_jwk=public_jwk,
-        upstream_base_url="http://example-upstream",
-        openclaw_bootstrap_base_url="http://bootstrap",
-        challenge_ttl_seconds=60,
-        session_ttl_seconds=300,
-        session_cookie_name="proxy-session",
-    )
-    client = TestClient(create_app(settings))
-    request_body = '{"env":{"ANTHROPIC_API_KEY":"abc"}}'
-    headers = auth_headers(
-        client,
-        private_key,
-        method="POST",
-        path="/api/private/bootstrap",
-        body=request_body,
-    )
+def test_private_bootstrap_endpoint_accepts_session_cookie() -> None:
+    client = make_client(openclaw_bootstrap_base_url="http://bootstrap")
+    passkey = VirtualPasskey()
+    initialize_enclave(client, passkey, bootstrap_env={"ANTHROPIC_API_KEY": "abc"})
+    DummyAsyncClient.requests = []
 
-    response = client.post("/api/private/bootstrap", headers=headers, content=request_body)
+    response = client.post("/api/private/bootstrap", content='{"env":{"ANTHROPIC_API_KEY":"abc"}}')
 
     assert response.status_code == 200
     assert response.json()["bootstrapped"] is True
-    assert DummyAsyncClient.requests[0]["url"] == "http://bootstrap/api/bootstrap/config"
-    assert DummyAsyncClient.requests[0]["content"] == b'{"env":{"ANTHROPIC_API_KEY":"abc"}}'
-
-
-def test_public_websocket_bypasses_auth() -> None:
-    client, private_key = make_client(
-        public_patterns=("/", "/assets/*", "/favicon.svg", "/healthz", "/api/public/*", "/hooks/*")
-    )
-    del private_key
-
-    with client.websocket_connect("/hooks/live") as websocket:
-        websocket.send_text("hello")
-        assert websocket.receive_text() == "echo:hello"
-
-    assert DummyWebSocketsModule.last_connection is not None
-    assert DummyWebSocketsModule.last_connection.url == "ws://example-upstream/hooks/live"
-    assert DummyWebSocketsModule.last_connection.origin == "http://example-upstream"
-    assert "Origin" not in (DummyWebSocketsModule.last_connection.additional_headers or {})
+    assert response.json()["env_keys"] == ["ANTHROPIC_API_KEY"]
+    assert DummyAsyncClient.requests == []

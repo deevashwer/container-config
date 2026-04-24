@@ -4,11 +4,10 @@ import asyncio
 import fnmatch
 import json
 import logging
-import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import SplitResult, urlsplit, urlunsplit
@@ -17,6 +16,7 @@ import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, status
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import ValidationError
 
 try:
     import websockets
@@ -31,21 +31,24 @@ except ImportError:  # pragma: no cover - exercised only in minimal local test e
         response = None
 
 from .models import (
-    ChallengeRequest,
-    ChallengeResponse,
+    PasskeyAuthenticationFinishRequest,
+    PasskeyInitializationFinishRequest,
     PublicConfigResponse,
-    SessionLoginRequest,
     SessionResponse,
     UpstreamBootstrapRequest,
 )
-from .security import (
-    AUTH_VERSION,
-    ChallengeError,
-    InMemoryChallengeStore,
-    normalize_method,
-    normalize_path,
-    sha256_hex,
-    verify_signature,
+from .passkeys import (
+    FileBackedPasskeyStore,
+    InMemoryPasskeyCeremonyStore,
+    PasskeyError,
+    PendingPasskeyCeremony,
+    StoredPasskeyCredential,
+    base64url_decode,
+    base64url_encode,
+    host_without_port,
+    isoformat_z,
+    verify_authentication_response,
+    verify_registration_response,
 )
 from .sessions import InMemorySessionStore, SessionError, StoredSession
 from .settings import Settings, get_settings
@@ -69,15 +72,9 @@ PROXY_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]
 
 @dataclass(frozen=True, slots=True)
 class VerifiedRequest:
-    key_id: str
+    credential_id: str
     auth_kind: str
-    challenge_id: str | None = None
     expires_at: datetime | None = None
-
-
-def request_target(request: Request) -> str:
-    query = request.url.query
-    return f"{request.url.path}?{query}" if query else request.url.path
 
 
 def normalize_forwarded_proto(scheme: str) -> str:
@@ -250,12 +247,51 @@ def get_runtime_settings(request: Request) -> Settings:
     return request.app.state.settings
 
 
-def get_challenge_store(request: Request) -> InMemoryChallengeStore:
-    return request.app.state.challenge_store
+def get_passkey_ceremony_store(request: Request) -> InMemoryPasskeyCeremonyStore:
+    return request.app.state.passkey_ceremony_store
+
+
+def get_passkey_store(request: Request) -> FileBackedPasskeyStore:
+    return request.app.state.passkey_store
 
 
 def get_session_store(request: Request) -> InMemorySessionStore:
     return request.app.state.session_store
+
+
+def request_external_host(request: Request) -> str:
+    forwarded_host = request.headers.get("x-forwarded-host", "").split(",", 1)[0].strip()
+    host = forwarded_host or request.headers.get("host", "").strip() or request.url.netloc
+    return host
+
+
+def request_external_origin(request: Request) -> str:
+    explicit_origin = request.headers.get("origin", "").strip()
+    if explicit_origin:
+        return explicit_origin.rstrip("/")
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip()
+    scheme = normalize_forwarded_proto(forwarded_proto or request.url.scheme)
+    host = request_external_host(request)
+    if not host:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="request host is not available for passkey verification",
+        )
+    return f"{scheme}://{host}"
+
+
+def resolve_passkey_rp_id(request: Request, settings: Settings) -> str:
+    if settings.passkey_rp_id:
+        return settings.passkey_rp_id
+    host = host_without_port(request_external_host(request))
+    if host:
+        return host
+    if request.url.hostname:
+        return request.url.hostname
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="passkey RP ID could not be derived from the incoming request",
+    )
 
 
 def sanitize_client_bootstrap_env(raw_env: dict[str, str] | None) -> dict[str, str]:
@@ -335,74 +371,16 @@ def is_public_path(path: str, settings: Settings) -> bool:
     return any(path_matches_pattern(path, pattern) for pattern in settings.public_path_patterns)
 
 
-async def require_owner_auth_headers(request: Request) -> VerifiedRequest:
-    settings = get_runtime_settings(request)
-    if settings.owner_public_key is None or settings.owner_key_id is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="OWNER_PUBLIC_KEY_JWK is not configured",
-        )
+async def gateway_ownership_claimed(passkey_store: FileBackedPasskeyStore) -> bool:
+    return await passkey_store.count() > 0
 
-    challenge_id = request.headers.get("x-auth-challenge-id", "").strip()
-    signature = request.headers.get("x-auth-signature", "").strip()
-    key_id = request.headers.get("x-auth-key-id", "").strip()
-    if not challenge_id or not signature or not key_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="missing auth headers",
-        )
-    if key_id != settings.owner_key_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="unknown owner key",
-        )
 
-    body = await request.body()
-    method = normalize_method(request.method)
-    path = normalize_path(request_target(request))
-    body_sha256 = sha256_hex(body)
-
-    challenge_store = get_challenge_store(request)
-    try:
-        challenge = await challenge_store.consume(challenge_id)
-    except ChallengeError as exc:
+async def ensure_initialization_available(passkey_store: FileBackedPasskeyStore) -> None:
+    if await gateway_ownership_claimed(passkey_store):
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=str(exc),
-        ) from exc
-
-    if challenge.method != method:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="challenge method mismatch",
+            status_code=status.HTTP_410_GONE,
+            detail="this enclave has already been initialized",
         )
-    if challenge.path != path:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="challenge path mismatch",
-        )
-    if challenge.body_sha256 != body_sha256:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="challenge body hash mismatch",
-        )
-
-    verified = verify_signature(
-        public_key=settings.owner_public_key,
-        signature_b64url=signature,
-        signing_payload=challenge.signing_payload,
-    )
-    if not verified:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="invalid signature",
-        )
-
-    return VerifiedRequest(
-        key_id=key_id,
-        auth_kind="headers",
-        challenge_id=challenge_id,
-    )
 
 
 async def try_session_auth(request: Request) -> VerifiedRequest | None:
@@ -418,7 +396,7 @@ async def try_session_auth(request: Request) -> VerifiedRequest | None:
         return None
 
     return VerifiedRequest(
-        key_id=session.key_id,
+        credential_id=session.credential_id,
         auth_kind="session",
         expires_at=session.expires_at,
     )
@@ -426,9 +404,94 @@ async def try_session_auth(request: Request) -> VerifiedRequest | None:
 
 async def require_authenticated_request(request: Request) -> VerifiedRequest:
     verified = await try_session_auth(request)
-    if verified is not None:
-        return verified
-    return await require_owner_auth_headers(request)
+    if verified is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="missing session cookie",
+        )
+    return verified
+
+
+def build_session_response(*, session: StoredSession) -> SessionResponse:
+    return SessionResponse(
+        authenticated=True,
+        credential_id=session.credential_id,
+        auth_kind="session",
+        expires_at=session.expires_at,
+    )
+
+
+def attach_authenticated_session_cookie(
+    response: Response,
+    *,
+    settings: Settings,
+    session: StoredSession,
+) -> None:
+    set_session_cookie(response, settings=settings, session=session)
+
+
+async def finalize_authenticated_session(
+    *,
+    runtime: Settings,
+    session_store: InMemorySessionStore,
+    credential_id: str,
+) -> Response:
+    session = await session_store.issue(credential_id=credential_id)
+    response = JSONResponse(build_session_response(session=session).model_dump(mode="json"))
+    attach_authenticated_session_cookie(response, settings=runtime, session=session)
+    return response
+
+
+def build_initialization_options(
+    *,
+    runtime: Settings,
+    challenge: PendingPasskeyCeremony,
+) -> dict[str, object]:
+    return {
+        "challenge_id": challenge.ceremony_id,
+        "public_key": {
+            "attestation": "none",
+            "authenticatorSelection": {
+                "residentKey": "preferred",
+                "userVerification": "required",
+            },
+            "challenge": challenge.challenge,
+            "excludeCredentials": [],
+            "pubKeyCredParams": [
+                {"type": "public-key", "alg": -7},
+            ],
+            "rp": {
+                "id": challenge.rp_id,
+                "name": runtime.passkey_rp_name,
+            },
+            "timeout": runtime.challenge_ttl_seconds * 1000,
+            "user": {
+                "displayName": runtime.app_name,
+                "id": challenge.challenge,
+                "name": "initializer",
+            },
+        },
+    }
+
+
+def build_authentication_options(
+    *,
+    runtime: Settings,
+    challenge: PendingPasskeyCeremony,
+) -> dict[str, object]:
+    return {
+        "challenge_id": challenge.ceremony_id,
+        "public_key": {
+            "allowCredentials": [
+                {"id": credential_id, "type": "public-key"}
+                for credential_id in challenge.allowed_credential_ids
+            ],
+            "challenge": challenge.challenge,
+            "rpId": challenge.rp_id,
+            "timeout": runtime.challenge_ttl_seconds * 1000,
+            "userVerification": "required",
+        },
+    }
 
 
 async def require_websocket_session(websocket: WebSocket) -> StoredSession:
@@ -479,7 +542,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title=runtime_settings.app_name, lifespan=lifespan)
     app.state.settings = runtime_settings
-    app.state.challenge_store = InMemoryChallengeStore(runtime_settings.challenge_ttl_seconds)
+    app.state.passkey_ceremony_store = InMemoryPasskeyCeremonyStore(runtime_settings.challenge_ttl_seconds)
+    app.state.passkey_store = FileBackedPasskeyStore(runtime_settings.passkey_store_path)
     app.state.session_store = InMemorySessionStore(runtime_settings.session_ttl_seconds)
     app.state.upstream_bootstrap_lock = asyncio.Lock()
     app.state.upstream_bootstrap_complete = False
@@ -498,62 +562,155 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"status": "ok"}
 
     @app.get("/api/public/config", response_model=PublicConfigResponse)
-    async def public_config(runtime: Settings = Depends(get_runtime_settings)) -> PublicConfigResponse:
+    async def public_config(
+        runtime: Settings = Depends(get_runtime_settings),
+        passkey_store: FileBackedPasskeyStore = Depends(get_passkey_store),
+    ) -> PublicConfigResponse:
+        passkey_count = await passkey_store.count()
         return PublicConfigResponse(
             app_name=runtime.app_name,
             challenge_ttl_seconds=runtime.challenge_ttl_seconds,
-            owner_key_id=runtime.owner_key_id,
-            owner_key_configured=runtime.owner_public_key is not None,
+            ownership_claimed=passkey_count > 0,
+            initialization_available=passkey_count == 0,
+            passkey_count=passkey_count,
             public_path_patterns=list(runtime.public_path_patterns),
             session_cookie_name=runtime.session_cookie_name,
             openclaw_workspace_path=runtime.openclaw_workspace_path,
         )
 
-    @app.post("/api/public/challenge", response_model=ChallengeResponse)
-    async def create_challenge(
-        payload: ChallengeRequest,
-        challenge_store: InMemoryChallengeStore = Depends(get_challenge_store),
+    @app.post("/api/public/init/options")
+    async def passkey_initialization_options(
+        request: Request,
         runtime: Settings = Depends(get_runtime_settings),
-    ) -> ChallengeResponse:
-        challenge = await challenge_store.issue(
-            method=payload.method,
-            path=payload.path,
-            body_sha256=payload.body_sha256,
+        ceremony_store: InMemoryPasskeyCeremonyStore = Depends(get_passkey_ceremony_store),
+        passkey_store: FileBackedPasskeyStore = Depends(get_passkey_store),
+    ) -> dict[str, object]:
+        await ensure_initialization_available(passkey_store)
+        challenge = await ceremony_store.issue(
+            purpose="initialize",
+            origin=request_external_origin(request),
+            rp_id=resolve_passkey_rp_id(request, runtime),
         )
-        return ChallengeResponse(
-            challenge_id=challenge.challenge_id,
-            nonce=challenge.nonce,
-            expires_at=challenge.expires_at,
-            key_id=runtime.owner_key_id,
-            signing_payload=challenge.signing_payload,
-            version=AUTH_VERSION,
-        )
+        return build_initialization_options(runtime=runtime, challenge=challenge)
 
-    @app.post("/api/private/session/login", response_model=SessionResponse)
-    async def login_session(
-        payload: SessionLoginRequest,
-        verified: VerifiedRequest = Depends(require_owner_auth_headers),
+    @app.post("/api/public/init/finish", response_model=SessionResponse)
+    async def finish_passkey_initialization(
+        payload: PasskeyInitializationFinishRequest,
         runtime: Settings = Depends(get_runtime_settings),
+        ceremony_store: InMemoryPasskeyCeremonyStore = Depends(get_passkey_ceremony_store),
+        passkey_store: FileBackedPasskeyStore = Depends(get_passkey_store),
         session_store: InMemorySessionStore = Depends(get_session_store),
     ) -> Response:
-        await ensure_upstream_bootstrapped(app, sanitize_client_bootstrap_env(payload.bootstrap_env))
-        session = await session_store.issue(key_id=verified.key_id)
-        response_payload = SessionResponse(
-            authenticated=True,
-            key_id=session.key_id,
-            auth_kind="session",
-            expires_at=session.expires_at,
+        await ensure_initialization_available(passkey_store)
+        sanitized_env = sanitize_client_bootstrap_env(payload.bootstrap_env)
+        try:
+            pending = await ceremony_store.consume(payload.challenge_id, purpose="initialize")
+            verified = verify_registration_response(
+                credential=payload.credential.model_dump(mode="python"),
+                pending=pending,
+            )
+            await ensure_upstream_bootstrapped(app, sanitized_env)
+            await passkey_store.add(
+                StoredPasskeyCredential(
+                    credential_id=verified.credential_id,
+                    public_key_pem=verified.public_key_pem,
+                    sign_count=verified.sign_count,
+                    created_at=isoformat_z(datetime.now(timezone.utc)),
+                )
+            )
+        except PasskeyError as exc:
+            if str(exc) == "this enclave has already been initialized":
+                raise HTTPException(
+                    status_code=status.HTTP_410_GONE,
+                    detail=str(exc),
+                ) from exc
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
+        return await finalize_authenticated_session(
+            runtime=runtime,
+            session_store=session_store,
+            credential_id=verified.credential_id,
         )
-        response = JSONResponse(response_payload.model_dump(mode="json"))
-        set_session_cookie(response, settings=runtime, session=session)
-        return response
+
+    @app.post("/api/public/passkeys/authenticate/options")
+    async def passkey_authentication_options(
+        request: Request,
+        runtime: Settings = Depends(get_runtime_settings),
+        ceremony_store: InMemoryPasskeyCeremonyStore = Depends(get_passkey_ceremony_store),
+        passkey_store: FileBackedPasskeyStore = Depends(get_passkey_store),
+    ) -> dict[str, object]:
+        credential_descriptors = await passkey_store.descriptors()
+        if not credential_descriptors:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="no passkey is registered for this gateway yet",
+            )
+        challenge = await ceremony_store.issue(
+            purpose="authenticate",
+            origin=request_external_origin(request),
+            rp_id=resolve_passkey_rp_id(request, runtime),
+            allowed_credential_ids=tuple(item["id"] for item in credential_descriptors),
+        )
+        return build_authentication_options(runtime=runtime, challenge=challenge)
+
+    @app.post("/api/public/passkeys/authenticate/finish", response_model=SessionResponse)
+    async def finish_passkey_authentication(
+        payload: PasskeyAuthenticationFinishRequest,
+        runtime: Settings = Depends(get_runtime_settings),
+        ceremony_store: InMemoryPasskeyCeremonyStore = Depends(get_passkey_ceremony_store),
+        passkey_store: FileBackedPasskeyStore = Depends(get_passkey_store),
+        session_store: InMemorySessionStore = Depends(get_session_store),
+    ) -> Response:
+        sanitized_env = sanitize_client_bootstrap_env(payload.bootstrap_env)
+        try:
+            pending = await ceremony_store.consume(payload.challenge_id, purpose="authenticate")
+            credential_id = base64url_encode(base64url_decode(payload.credential.rawId))
+            stored = await passkey_store.get(credential_id)
+            if stored is None:
+                raise PasskeyError("unknown passkey credential")
+            verified = verify_authentication_response(
+                credential=payload.credential.model_dump(mode="python"),
+                pending=pending,
+                stored=stored,
+            )
+            await passkey_store.update_usage(
+                verified.credential_id,
+                sign_count=verified.next_sign_count,
+            )
+        except PasskeyError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=str(exc),
+            ) from exc
+        await ensure_upstream_bootstrapped(app, sanitized_env)
+        return await finalize_authenticated_session(
+            runtime=runtime,
+            session_store=session_store,
+            credential_id=verified.credential_id,
+        )
 
     @app.post("/api/private/bootstrap")
     async def bootstrap_upstream(
-        payload: UpstreamBootstrapRequest,
+        request: Request,
         verified: VerifiedRequest = Depends(require_authenticated_request),
     ) -> dict[str, object]:
         del verified
+        try:
+            raw_payload = json.loads((await request.body()) or b"{}")
+            payload = UpstreamBootstrapRequest.model_validate(raw_payload)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="request body must be valid JSON",
+            ) from exc
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=exc.errors(),
+            ) from exc
+
         sanitized_env = sanitize_client_bootstrap_env(payload.env)
         await ensure_upstream_bootstrapped(app, sanitized_env)
         return {
@@ -566,7 +723,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         verified = await require_authenticated_request(request)
         return SessionResponse(
             authenticated=True,
-            key_id=verified.key_id,
+            credential_id=verified.credential_id,
             auth_kind=verified.auth_kind,
             expires_at=verified.expires_at,
         )
@@ -583,7 +740,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         response = JSONResponse(
             SessionResponse(
                 authenticated=False,
-                key_id=None,
+                credential_id=None,
                 auth_kind=None,
                 expires_at=None,
             ).model_dump(mode="json")

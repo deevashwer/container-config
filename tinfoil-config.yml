@@ -14,10 +14,10 @@ containers:
       - PORT: "8080"
       - CHALLENGE_TTL_SECONDS: "60"
       - SESSION_TTL_SECONDS: "43200"
-      - SESSION_COOKIE_NAME: "openclaw_owner_session"
+      - SESSION_COOKIE_NAME: "openclaw_passkey_session"
       - SESSION_COOKIE_SECURE: "true"
       - OPENCLAW_WORKSPACE_PATH: "/openclaw/"
-      - OWNER_PUBLIC_KEY_JWK: '{"crv":"P-256","kty":"EC","x":"WUvrTCSyyHsHKjAhmv5wHJV6JNvOtqSzUElseK3cSiE","y":"uJ7iTfQX-s8OOX7KXuQ5eBB5aDK5dWujLKrI_qe2Vr0"}'
+      - PASSKEY_STORE_PATH: "/var/lib/openclaw-auth/passkeys.json"
       - OPENCLAW_BOOTSTRAP_BASE_URL: "http://127.0.0.1:18788"
       - UPSTREAM_BASE_URL: "http://127.0.0.1:18789"
       - AUX_APPLICATION_BASE_URL: "http://127.0.0.1:3000"
